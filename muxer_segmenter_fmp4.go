@@ -112,6 +112,11 @@ type muxerSegmenterFMP4 struct {
 	firstSegmentFinalized          bool
 	sampleDurations                map[time.Duration]struct{}
 	adjustedPartDuration           time.Duration
+	// streamStartDTS is the DTS of the first sample of the whole stream.
+	// Every BaseMediaDecodeTime is expressed relative to it, so timestamps
+	// stay non-negative even when the stream starts before the origin (e.g.
+	// a countdown with negative DTS) and remain continuous across segments.
+	streamStartDTS time.Duration
 }
 
 func newMuxerSegmenterFMP4(
@@ -324,11 +329,13 @@ func (m *muxerSegmenterFMP4) writeVideo(
 	if m.currentSegment == nil {
 		// create first segment
 		var err error
+		m.streamStartDTS = sample.dts
 		m.currentSegment, err = newMuxerSegmentFMP4(
 			m.lowLatency,
 			m.takeSegmentID(),
 			sample.ntp,
 			sample.dts,
+			m.streamStartDTS,
 			m.segmentMaxSize,
 			m.videoTrack,
 			m.audioTrack,
@@ -373,6 +380,7 @@ func (m *muxerSegmenterFMP4) writeVideo(
 			m.takeSegmentID(),
 			m.nextVideoSample.ntp,
 			m.nextVideoSample.dts,
+			m.streamStartDTS,
 			m.segmentMaxSize,
 			m.videoTrack,
 			m.audioTrack,
@@ -440,7 +448,7 @@ func (m *muxerSegmenterFMP4) writeAudio(ntp time.Time, dts time.Duration, au []b
 		}
 	}
 
-	sample := &augmentedAudioSample{
+	newSample := &augmentedAudioSample{
 		PartSample: fmp4.PartSample{
 			Payload: au,
 		},
@@ -449,7 +457,8 @@ func (m *muxerSegmenterFMP4) writeAudio(ntp time.Time, dts time.Duration, au []b
 	}
 
 	// put samples into a queue in order to compute the sample duration
-	sample, m.nextAudioSample = m.nextAudioSample, sample
+	sample := m.nextAudioSample
+	m.nextAudioSample = newSample
 	if sample == nil {
 		return nil
 	}
@@ -459,11 +468,13 @@ func (m *muxerSegmenterFMP4) writeAudio(ntp time.Time, dts time.Duration, au []b
 		if m.currentSegment == nil {
 			// create first segment
 			var err error
+			m.streamStartDTS = sample.dts
 			m.currentSegment, err = newMuxerSegmentFMP4(
 				m.lowLatency,
 				m.takeSegmentID(),
 				sample.ntp,
 				sample.dts,
+				m.streamStartDTS,
 				m.segmentMaxSize,
 				m.videoTrack,
 				m.audioTrack,
@@ -482,6 +493,19 @@ func (m *muxerSegmenterFMP4) writeAudio(ntp time.Time, dts time.Duration, au []b
 	} else {
 		// wait for the video track
 		if m.currentSegment == nil {
+			return nil
+		}
+
+		// discard pre-roll samples, i.e. samples that precede the beginning
+		// of the current segment (e.g. an audio track starting before a
+		// countdown video). The dequeued sample is checked here: a sample
+		// stays in the queue until the next one arrives, so dropping the
+		// incoming sample instead would leave the stale pre-roll sample in
+		// the queue and write it into a later part with a negative BaseTime.
+		// Samples inside the segment but older than the current part are
+		// kept; the BaseTime is relative to the stream start and thus always
+		// non-negative.
+		if sample.dts < m.currentSegment.startDTS {
 			return nil
 		}
 	}
@@ -511,6 +535,7 @@ func (m *muxerSegmenterFMP4) writeAudio(ntp time.Time, dts time.Duration, au []b
 			m.takeSegmentID(),
 			m.nextAudioSample.ntp,
 			m.nextAudioSample.dts,
+			m.streamStartDTS,
 			m.segmentMaxSize,
 			m.videoTrack,
 			m.audioTrack,

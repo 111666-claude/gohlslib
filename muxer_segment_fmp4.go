@@ -13,6 +13,7 @@ type muxerSegmentFMP4 struct {
 	id             uint64
 	startNTP       time.Time
 	startDTS       time.Duration
+	streamStartDTS time.Duration
 	segmentMaxSize uint64
 	videoTrack     *Track
 	audioTrack     *Track
@@ -36,6 +37,7 @@ func newMuxerSegmentFMP4(
 	id uint64,
 	startNTP time.Time,
 	startDTS time.Duration,
+	streamStartDTS time.Duration,
 	segmentMaxSize uint64,
 	videoTrack *Track,
 	audioTrack *Track,
@@ -52,6 +54,7 @@ func newMuxerSegmentFMP4(
 		id:             id,
 		startNTP:       startNTP,
 		startDTS:       startDTS,
+		streamStartDTS: streamStartDTS,
 		segmentMaxSize: segmentMaxSize,
 		videoTrack:     videoTrack,
 		audioTrack:     audioTrack,
@@ -72,6 +75,7 @@ func newMuxerSegmentFMP4(
 
 	s.currentPart = newMuxerPart(
 		startDTS,
+		streamStartDTS,
 		s.videoTrack,
 		s.audioTrack,
 		s.audioTimeScale,
@@ -155,6 +159,7 @@ func (s *muxerSegmentFMP4) writeVideo(
 
 		s.currentPart = newMuxerPart(
 			nextDTS,
+			s.streamStartDTS,
 			s.videoTrack,
 			s.audioTrack,
 			s.audioTimeScale,
@@ -193,6 +198,7 @@ func (s *muxerSegmentFMP4) writeAudio(
 
 		s.currentPart = newMuxerPart(
 			nextAudioSampleDTS,
+			s.streamStartDTS,
 			s.videoTrack,
 			s.audioTrack,
 			s.audioTimeScale,

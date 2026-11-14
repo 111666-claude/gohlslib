@@ -15,6 +15,7 @@ func partName(prefix string, id uint64) string {
 
 type muxerPart struct {
 	startDTS       time.Duration
+	streamStartDTS time.Duration
 	videoTrack     *Track
 	audioTrack     *Track
 	audioTimeScale uint32
@@ -34,6 +35,7 @@ type muxerPart struct {
 
 func newMuxerPart(
 	startDTS time.Duration,
+	streamStartDTS time.Duration,
 	videoTrack *Track,
 	audioTrack *Track,
 	audioTimeScale uint32,
@@ -43,6 +45,7 @@ func newMuxerPart(
 ) *muxerPart {
 	p := &muxerPart{
 		startDTS:       startDTS,
+		streamStartDTS: streamStartDTS,
 		videoTrack:     videoTrack,
 		audioTrack:     audioTrack,
 		audioTimeScale: audioTimeScale,
@@ -75,8 +78,12 @@ func (p *muxerPart) finalize(nextDTS time.Duration) error {
 
 	if p.videoSamples != nil {
 		part.Tracks = append(part.Tracks, &fmp4.PartTrack{
-			ID:       1,
-			BaseTime: durationGoToMp4(p.videoStartDTS, 90000),
+			ID: 1,
+			// BaseTime is relative to the first sample of the whole stream.
+			// This keeps the timeline continuous across parts and segments
+			// and prevents negative timestamps (e.g. pre-show countdowns)
+			// from underflowing when converted to an unsigned MP4 time.
+			BaseTime: durationGoToMp4(p.videoStartDTS-p.streamStartDTS, 90000),
 			Samples:  p.videoSamples,
 		})
 	}
@@ -84,7 +91,7 @@ func (p *muxerPart) finalize(nextDTS time.Duration) error {
 	if p.audioSamples != nil {
 		part.Tracks = append(part.Tracks, &fmp4.PartTrack{
 			ID:       1 + len(part.Tracks),
-			BaseTime: durationGoToMp4(p.audioStartDTS, p.audioTimeScale),
+			BaseTime: durationGoToMp4(p.audioStartDTS-p.streamStartDTS, p.audioTimeScale),
 			Samples:  p.audioSamples,
 		})
 	}
