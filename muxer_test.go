@@ -3,7 +3,9 @@ package gohlslib
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,6 +21,8 @@ import (
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4audio"
 	"github.com/bluenviron/mediacommon/v2/pkg/formats/fmp4"
 	mp4codecs "github.com/bluenviron/mediacommon/v2/pkg/formats/mp4/codecs"
+	mcmpegts "github.com/bluenviron/mediacommon/v2/pkg/formats/mpegts"
+	tscodecs "github.com/bluenviron/mediacommon/v2/pkg/formats/mpegts/codecs"
 	"github.com/stretchr/testify/require"
 
 	"github.com/bluenviron/gohlslib/v2/pkg/codecs"
@@ -1131,6 +1135,467 @@ func TestMuxerRejectsInvalidClockRate(t *testing.T) {
 			err := m.Start()
 			require.EqualError(t, err, ca.errorRe)
 		})
+	}
+}
+
+// mpegtsSegmentTimestamps contains the packet timestamps read back from a MPEG-TS segment.
+type mpegtsSegmentTimestamps struct {
+	audioPTSs []int64
+	videoPTSs []int64
+}
+
+// readMPEGTSTimestamps downloads a MPEG-TS segment from the muxer and returns the PTS of
+// every MPEG-4 Audio and H264 packet contained inside it, in 90kHz units.
+func readMPEGTSTimestamps(t *testing.T, m *Muxer, segmentPath string) mpegtsSegmentTimestamps {
+	t.Helper()
+
+	byts, _, err := doRequest(m, segmentPath)
+	require.NoError(t, err)
+
+	r := &mcmpegts.Reader{R: bytes.NewReader(byts)}
+	err = r.Initialize()
+	require.NoError(t, err)
+
+	var ts mpegtsSegmentTimestamps
+
+	for _, track := range r.Tracks() {
+		switch track.Codec.(type) {
+		case *tscodecs.MPEG4Audio:
+			r.OnDataMPEG4Audio(track, func(pts int64, _ [][]byte) error {
+				ts.audioPTSs = append(ts.audioPTSs, pts)
+				return nil
+			})
+
+		case *tscodecs.H264:
+			r.OnDataH264(track, func(pts int64, _ int64, _ [][]byte) error {
+				ts.videoPTSs = append(ts.videoPTSs, pts)
+				return nil
+			})
+		}
+	}
+
+	for {
+		err = r.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+	}
+
+	return ts
+}
+
+// segmentPaths returns the path of every segment listed in the media playlist.
+func segmentPaths(t *testing.T, m *Muxer) []string {
+	t.Helper()
+
+	byts, _, err := doRequest(m, "main_stream.m3u8")
+	require.NoError(t, err)
+
+	re := regexp.MustCompile(`(.*?_seg[0-9]+\.ts)`)
+	matches := re.FindAllStringSubmatch(string(byts), -1)
+	require.NotEmpty(t, matches)
+
+	ret := make([]string, len(matches))
+	for i, ma := range matches {
+		ret[i] = ma[1]
+	}
+
+	return ret
+}
+
+// firstSegmentPath returns the path of the first segment listed in the media playlist.
+func firstSegmentPath(t *testing.T, m *Muxer) string {
+	t.Helper()
+
+	byts, _, err := doRequest(m, "main_stream.m3u8")
+	require.NoError(t, err)
+
+	re := regexp.MustCompile(`(.*?_seg[0-9]+\.ts)`)
+	ma := re.FindStringSubmatch(string(byts))
+	require.NotNil(t, ma)
+
+	return ma[1]
+}
+
+func TestMuxerMPEGTSAACJitter(t *testing.T) {
+	track := &Track{
+		Codec:     &codecs.MPEG4Audio{Config: testAACConfig},
+		ClockRate: 44100,
+	}
+
+	m := &Muxer{
+		Variant:            MuxerVariantMPEGTS,
+		SegmentCount:       3,
+		SegmentMinDuration: 10 * time.Second,
+		Tracks:             []*Track{track},
+	}
+
+	err := m.Start()
+	require.NoError(t, err)
+	defer m.Close()
+
+	// first AU starts at 0.
+	err = m.WriteMPEG4Audio(track, testTime, 0, [][]byte{{0x21, 0x10}})
+	require.NoError(t, err)
+
+	// second AU has a source timestamp 250ms ahead of the continuous audio timeline
+	// (one AU is 1024/44100 = 23.2ms). This is a capture clock jitter, not a real jump:
+	// the muxer must keep the timeline continuous instead of following the source.
+	jitterPTS := int64(1024) + int64(250*time.Millisecond)*44100/int64(time.Second)
+	err = m.WriteMPEG4Audio(track, testTime, jitterPTS, [][]byte{{0x21, 0x10}})
+	require.NoError(t, err)
+
+	// finalize the segment.
+	err = m.WriteMPEG4Audio(track, testTime, int64(12*track.ClockRate), [][]byte{{0x21, 0x10}})
+	require.NoError(t, err)
+
+	ptss := readMPEGTSTimestamps(t, m, firstSegmentPath(t, m)).audioPTSs
+
+	require.GreaterOrEqual(t, len(ptss), 2)
+	require.Equal(t, int64(0), ptss[0])
+	// 1024 ticks at 44100Hz converted to 90kHz.
+	require.Equal(t, int64(1024*90000/44100), ptss[1])
+
+	// all timestamps must be continuous: each one is one AU ahead of the previous.
+	auTicks := int64(1024) * 90000 / 44100
+	for i := 1; i < len(ptss); i++ {
+		require.Equal(t, auTicks, ptss[i]-ptss[i-1], "timestamps are not continuous")
+	}
+}
+
+func TestMuxerMPEGTSAACJitterThenJump(t *testing.T) {
+	track := &Track{
+		Codec:     &codecs.MPEG4Audio{Config: testAACConfig},
+		ClockRate: 44100,
+	}
+
+	m := &Muxer{
+		Variant:            MuxerVariantMPEGTS,
+		SegmentCount:       3,
+		SegmentMinDuration: 10 * time.Second,
+		Tracks:             []*Track{track},
+	}
+
+	err := m.Start()
+	require.NoError(t, err)
+	defer m.Close()
+
+	// first AU starts at 0.
+	err = m.WriteMPEG4Audio(track, testTime, 0, [][]byte{{0x21, 0x10}})
+	require.NoError(t, err)
+
+	// the following AUs carry a small jitter for three frames in a row.
+	// all of them are below the tolerance, hence the timeline stays continuous.
+	err = m.WriteMPEG4Audio(track, testTime, int64(1024+track.ClockRate/4), [][]byte{{0x21, 0x10}})
+	require.NoError(t, err)
+
+	err = m.WriteMPEG4Audio(track, testTime, 2*int64(1024)+int64(track.ClockRate)/8, [][]byte{{0x21, 0x10}})
+	require.NoError(t, err)
+
+	// this one really jumps to 2 seconds: the muxer must re-sync to the source.
+	err = m.WriteMPEG4Audio(track, testTime, 2*int64(track.ClockRate), [][]byte{{0x21, 0x10}})
+	require.NoError(t, err)
+
+	// next AU is continuous with the new source timestamp.
+	err = m.WriteMPEG4Audio(track, testTime, 2*int64(track.ClockRate)+1024, [][]byte{{0x21, 0x10}})
+	require.NoError(t, err)
+
+	// finalize the segment.
+	err = m.WriteMPEG4Audio(track, testTime, int64(12*track.ClockRate), [][]byte{{0x21, 0x10}})
+	require.NoError(t, err)
+
+	ptss := readMPEGTSTimestamps(t, m, firstSegmentPath(t, m)).audioPTSs
+
+	require.GreaterOrEqual(t, len(ptss), 5)
+	require.Equal(t, int64(0), ptss[0])
+	require.Equal(t, int64(1024*90000/44100), ptss[1])
+	require.Equal(t, int64(2*1024*90000/44100), ptss[2])
+	// after the real jump, the PTS follows the source again.
+	require.Equal(t, int64(2*90000), ptss[3])
+	// the timeline keeps advancing by one AU afterwards.
+	require.Equal(t, 2*int64(90000)+1024*90000/44100, ptss[4])
+}
+
+func TestMuxerMPEGTSAACMultipleAccessUnits(t *testing.T) {
+	track := &Track{
+		Codec:     &codecs.MPEG4Audio{Config: testAACConfig},
+		ClockRate: 44100,
+	}
+
+	m := &Muxer{
+		Variant:            MuxerVariantMPEGTS,
+		SegmentCount:       3,
+		SegmentMinDuration: 10 * time.Second,
+		Tracks:             []*Track{track},
+	}
+
+	err := m.Start()
+	require.NoError(t, err)
+	defer m.Close()
+
+	// a single call carrying multiple AUs: the PTS is one per call,
+	// while AU continuity must account for every AU carried by the call.
+	err = m.WriteMPEG4Audio(track, testTime, 0,
+		[][]byte{{0x21, 0x10}, {0x21, 0x10}, {0x21, 0x10}})
+	require.NoError(t, err)
+
+	// the source timestamp of this call matches the AU-counted timeline exactly.
+	err = m.WriteMPEG4Audio(track, testTime, 3*int64(1024),
+		[][]byte{{0x21, 0x10}, {0x21, 0x10}})
+	require.NoError(t, err)
+
+	// and this one accounts for the two AUs carried by the previous call.
+	err = m.WriteMPEG4Audio(track, testTime, 5*int64(1024),
+		[][]byte{{0x21, 0x10}})
+	require.NoError(t, err)
+
+	// finalize the segment.
+	err = m.WriteMPEG4Audio(track, testTime, int64(12*track.ClockRate), [][]byte{{0x21, 0x10}})
+	require.NoError(t, err)
+
+	ptss := readMPEGTSTimestamps(t, m, firstSegmentPath(t, m)).audioPTSs
+
+	require.GreaterOrEqual(t, len(ptss), 3)
+	require.Equal(t, int64(0), ptss[0])
+	require.Equal(t, int64(3*1024*90000/44100), ptss[1])
+	require.Equal(t, int64(5*1024*90000/44100), ptss[2])
+}
+
+func TestMuxerMPEGTSAACDriftTolerance(t *testing.T) {
+	toleranceTicks := int64(mpegtsAACPTSDriftTolerance) * 44100 / int64(time.Second)
+
+	for _, ca := range []struct {
+		name      string
+		startPTS  int64
+		sourcePTS int64
+		expected  int64
+	}{
+		{
+			name:      "just within tolerance",
+			sourcePTS: 1024 + toleranceTicks - 1,
+			expected:  1024,
+		},
+		{
+			name:      "exactly at tolerance",
+			sourcePTS: 1024 + toleranceTicks,
+			expected:  1024,
+		},
+		{
+			name:      "just beyond tolerance",
+			sourcePTS: 1024 + toleranceTicks + 1,
+			expected:  1024 + toleranceTicks + 1,
+		},
+		{
+			name:      "backwards within tolerance",
+			startPTS:  2 * 44100,
+			sourcePTS: 2*44100 + 1024 - toleranceTicks + 1,
+			expected:  2*44100 + 1024,
+		},
+		{
+			name:      "backwards beyond tolerance",
+			startPTS:  2 * 44100,
+			sourcePTS: 2*44100 + 1024 - toleranceTicks - 1,
+			expected:  2*44100 + 1024 - toleranceTicks - 1,
+		},
+	} {
+		t.Run(ca.name, func(t *testing.T) {
+			track := &Track{
+				Codec:     &codecs.MPEG4Audio{Config: testAACConfig},
+				ClockRate: 44100,
+			}
+
+			m := &Muxer{
+				Variant:            MuxerVariantMPEGTS,
+				SegmentCount:       3,
+				SegmentMinDuration: 10 * time.Second,
+				Tracks:             []*Track{track},
+			}
+
+			err := m.Start()
+			require.NoError(t, err)
+			defer m.Close()
+
+			err = m.WriteMPEG4Audio(track, testTime, ca.startPTS, [][]byte{{0x21, 0x10}})
+			require.NoError(t, err)
+
+			err = m.WriteMPEG4Audio(track, testTime, ca.sourcePTS, [][]byte{{0x21, 0x10}})
+			require.NoError(t, err)
+
+			// finalize the segment.
+			err = m.WriteMPEG4Audio(track, testTime, int64(12*track.ClockRate), [][]byte{{0x21, 0x10}})
+			require.NoError(t, err)
+
+			ptss := readMPEGTSTimestamps(t, m, firstSegmentPath(t, m)).audioPTSs
+			require.GreaterOrEqual(t, len(ptss), 2)
+
+			require.Equal(t, ca.startPTS*90000/44100, ptss[0])
+			require.Equal(t, ca.expected*90000/44100, ptss[1])
+		})
+	}
+}
+
+func TestMuxerMPEGTSAACJitterAcrossSegments(t *testing.T) {
+	track := &Track{
+		Codec:     &codecs.MPEG4Audio{Config: testAACConfig},
+		ClockRate: 44100,
+	}
+
+	m := &Muxer{
+		Variant:            MuxerVariantMPEGTS,
+		SegmentCount:       10,
+		SegmentMinDuration: 1 * time.Second,
+		Tracks:             []*Track{track},
+	}
+
+	err := m.Start()
+	require.NoError(t, err)
+	defer m.Close()
+
+	// 5 seconds of audio, with a small capture jitter every 10 AUs.
+	const auCount = 5 * 44100 / 1024
+	jitterTicks := int64(250*time.Millisecond) * 44100 / int64(time.Second)
+
+	for i := range auCount {
+		pts := int64(i) * 1024
+		if i%10 == 5 {
+			pts += jitterTicks
+		}
+
+		err = m.WriteMPEG4Audio(track, testTime.Add(time.Duration(i)*1024*time.Second/44100),
+			pts, [][]byte{{0x21, 0x10}})
+		require.NoError(t, err)
+	}
+
+	paths := segmentPaths(t, m)
+	require.GreaterOrEqual(t, len(paths), 2, "stream should span multiple segments")
+
+	var lastPTS *int64
+
+	for _, path := range paths {
+		ptss := readMPEGTSTimestamps(t, m, path).audioPTSs
+		require.NotEmpty(t, ptss, "segment %s has no audio", path)
+
+		if lastPTS != nil {
+			// the timeline must not jump between segments.
+			require.InDelta(t, int64(1024*90000/44100), ptss[0]-*lastPTS, 1,
+				"timestamp discontinuity between segments")
+		}
+
+		for i := 1; i < len(ptss); i++ {
+			require.InDelta(t, int64(1024*90000/44100), ptss[i]-ptss[i-1], 1,
+				"timestamps are not continuous inside segment %s", path)
+		}
+
+		lastPTS = &ptss[len(ptss)-1]
+	}
+}
+
+func TestMuxerMPEGTSAACJitterWithVideo(t *testing.T) {
+	audioTrack := &Track{
+		Codec:     &codecs.MPEG4Audio{Config: testAACConfig},
+		ClockRate: 44100,
+	}
+
+	m := &Muxer{
+		Variant:            MuxerVariantMPEGTS,
+		SegmentCount:       3,
+		SegmentMinDuration: 1 * time.Second,
+		Tracks:             []*Track{testVideoTrack, audioTrack},
+	}
+
+	err := m.Start()
+	require.NoError(t, err)
+	defer m.Close()
+
+	// the video track is leading and drives segment creation.
+	err = m.WriteH264(testVideoTrack, testTime, 0,
+		[][]byte{testH264SPS, {8}, {5}})
+	require.NoError(t, err)
+
+	jitterTicks := int64(250*time.Millisecond) * 44100 / int64(time.Second)
+
+	for i := range 4 {
+		// audio carries a small jitter on every other AU.
+		audioPTS := int64(i) * 1024
+		if i%2 == 1 {
+			audioPTS += jitterTicks
+		}
+
+		err = m.WriteMPEG4Audio(audioTrack, testTime, audioPTS, [][]byte{{0x21, 0x10}})
+		require.NoError(t, err)
+	}
+
+	// a second video frame, still inside the first segment.
+	err = m.WriteH264(testVideoTrack, testTime.Add(500*time.Millisecond), 45000,
+		[][]byte{testH264SPS, {8}, {5}})
+	require.NoError(t, err)
+
+	// this one rotates the segment, finalizing the first one.
+	err = m.WriteH264(testVideoTrack, testTime.Add(time.Second), 90000,
+		[][]byte{testH264SPS, {8}, {5}})
+	require.NoError(t, err)
+
+	ts := readMPEGTSTimestamps(t, m, firstSegmentPath(t, m))
+
+	// video timestamps must not be affected by audio jitter.
+	require.GreaterOrEqual(t, len(ts.videoPTSs), 2)
+	require.Equal(t, int64(0), ts.videoPTSs[0])
+	require.Equal(t, int64(45000), ts.videoPTSs[1])
+
+	require.GreaterOrEqual(t, len(ts.audioPTSs), 4)
+	require.Equal(t, int64(0), ts.audioPTSs[0])
+	for i := 1; i < len(ts.audioPTSs); i++ {
+		require.InDelta(t, int64(1024*90000/44100), ts.audioPTSs[i]-ts.audioPTSs[i-1], 1,
+			"audio timestamps are not continuous")
+	}
+}
+
+func TestMuxerMPEGTSAACRoundTrip(t *testing.T) {
+	track := &Track{
+		Codec:     &codecs.MPEG4Audio{Config: testAACConfig},
+		ClockRate: 44100,
+	}
+
+	m := &Muxer{
+		Variant:            MuxerVariantMPEGTS,
+		SegmentCount:       10,
+		SegmentMinDuration: 1 * time.Second,
+		Tracks:             []*Track{track},
+	}
+
+	err := m.Start()
+	require.NoError(t, err)
+	defer m.Close()
+
+	// write a sustained, perfectly continuous stream spanning multiple segments.
+	const auCount = 4 * 44100 / 1024
+
+	for i := range auCount {
+		err = m.WriteMPEG4Audio(track, testTime.Add(time.Duration(i)*1024*time.Second/44100),
+			int64(i)*1024, [][]byte{{0x21, 0x10}})
+		require.NoError(t, err)
+	}
+
+	paths := segmentPaths(t, m)
+	require.GreaterOrEqual(t, len(paths), 2, "stream should span multiple segments")
+
+	allPTSs := make([]int64, 0, auCount)
+
+	for _, path := range paths {
+		allPTSs = append(allPTSs, readMPEGTSTimestamps(t, m, path).audioPTSs...)
+	}
+
+	require.NotEmpty(t, allPTSs)
+
+	// every AU must be read back, in order, with a continuous timeline.
+	for i := 1; i < len(allPTSs); i++ {
+		require.InDelta(t, int64(1024*90000/44100), allPTSs[i]-allPTSs[i-1], 1,
+			"timestamps are not continuous at %d", i)
+	}
+
+	for i, pts := range allPTSs {
+		require.Equal(t, int64(i)*1024*90000/44100, pts, "unexpected timestamp at %d", i)
 	}
 }
 
