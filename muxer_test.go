@@ -1012,3 +1012,159 @@ func TestMuxerFMP4SequenceNumber(t *testing.T) {
 		require.Equal(t, uint32(i), parts[0].SequenceNumber)
 	}
 }
+
+func TestMuxerInvalidFolder(t *testing.T) {
+	for _, ca := range []string{
+		"mpegts",
+		"fmp4",
+	} {
+		t.Run(ca, func(t *testing.T) {
+			var v MuxerVariant
+			if ca == "mpegts" {
+				v = MuxerVariantMPEGTS
+			} else {
+				v = MuxerVariantFMP4
+			}
+
+			m := &Muxer{
+				Variant:         v,
+				SegmentCount:    7,
+				SegmentDuration: 1 * time.Second,
+				VideoTrack:      testVideoTrack,
+				Directory:       "/nonexisting",
+			}
+
+			err := m.Start()
+			require.NoError(t, err)
+			defer m.Close()
+
+			// the fMP4 segmenter can only detect the failure when switching
+			// segment, since the first segment is created lazily; the MPEG-TS
+			// segmenter can detect it immediately.
+			for i := 0; i < 2; i++ {
+				err = m.WriteH26x(testTime, time.Duration(i)*time.Second, [][]byte{
+					testSPS, // SPS
+					{8},     // PPS
+					{5},     // IDR
+				})
+
+				if ca == "mpegts" || i == 1 {
+					require.Error(t, err)
+				} else {
+					require.NoError(t, err)
+				}
+			}
+		})
+	}
+}
+
+func TestMuxerInvalidFolder100Rounds(t *testing.T) {
+	for _, ca := range []string{
+		"mpegts",
+		"fmp4",
+	} {
+		t.Run(ca, func(t *testing.T) {
+			var v MuxerVariant
+			if ca == "mpegts" {
+				v = MuxerVariantMPEGTS
+			} else {
+				v = MuxerVariantFMP4
+			}
+
+			// errors must be returned, never reported as a successful save,
+			// and must never crash the process.
+			dir := filepath.Join(t.TempDir(), "nonexisting")
+
+			for i := 0; i < 100; i++ {
+				m := &Muxer{
+					Variant:            v,
+					SegmentCount:       7,
+					SegmentMinDuration: 1 * time.Second,
+					VideoTrack:         testVideoTrack,
+					Directory:          dir,
+				}
+
+				err := m.Start()
+				require.NoError(t, err)
+
+				// the fMP4 segmenter detects the failure when the first
+				// segment is actually created, therefore the first write
+				// can still be accepted while samples are being queued.
+				for j := 0; j < 3; j++ {
+					err = m.WriteH26x(testTime, time.Duration(j)*time.Second, [][]byte{
+						testSPS, // SPS
+						{8},     // PPS
+						{5},     // IDR
+					})
+
+					if ca == "mpegts" || j >= 1 {
+						require.Error(t, err)
+					} else {
+						require.NoError(t, err)
+					}
+				}
+
+				m.Close()
+			}
+		})
+	}
+}
+
+func TestMuxerWriteFailureOnSegmentSwitch(t *testing.T) {
+	for _, ca := range []string{
+		"mpegts",
+		"fmp4",
+	} {
+		t.Run(ca, func(t *testing.T) {
+			var v MuxerVariant
+			if ca == "mpegts" {
+				v = MuxerVariantMPEGTS
+			} else {
+				v = MuxerVariantFMP4
+			}
+
+			for i := 0; i < 100; i++ {
+				dir, err := os.MkdirTemp("", "gohlslib")
+				require.NoError(t, err)
+
+				m := &Muxer{
+					Variant:            v,
+					SegmentCount:       7,
+					SegmentMinDuration: 1 * time.Second,
+					VideoTrack:         testVideoTrack,
+					Directory:          dir,
+				}
+
+				err = m.Start()
+				require.NoError(t, err)
+
+				// first segment is written successfully
+				err = m.WriteH26x(testTime, 0, [][]byte{
+					testSPS, // SPS
+					{8},     // PPS
+					{5},     // IDR
+				})
+				require.NoError(t, err)
+
+				// make the directory unusable, so that segment rotation fails
+				err = os.RemoveAll(dir)
+				require.NoError(t, err)
+				err = os.WriteFile(dir, []byte{}, 0o644)
+				require.NoError(t, err)
+
+				err = m.WriteH26x(testTime, 1*time.Second, [][]byte{
+					testSPS, // SPS
+					{8},     // PPS
+					{5},     // IDR
+				})
+				require.Error(t, err)
+
+				// resources must be closable without leaving leftovers
+				m.Close()
+
+				err = os.RemoveAll(dir)
+				require.NoError(t, err)
+			}
+		})
+	}
+}
