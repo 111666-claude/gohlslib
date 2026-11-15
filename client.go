@@ -73,6 +73,10 @@ type ClientOnDataFLACFunc func(pts int64, frame []byte)
 // ClientOnDataKLVFunc is the prototype of the function passed to OnDataKLV().
 type ClientOnDataKLVFunc func(pts int64, uni []byte)
 
+// ClientOnDataWebVTTFunc is the prototype of the function passed to OnDataWebVTT().
+// start and end are cue times on the media timeline.
+type ClientOnDataWebVTTFunc func(start time.Duration, end time.Duration, text string)
+
 func clientAbsoluteURL(base *url.URL, relative string) (*url.URL, error) {
 	u, err := url.Parse(relative)
 	if err != nil {
@@ -96,6 +100,10 @@ type Client struct {
 	// expressed as number of segments.
 	// It defaults to 5.
 	MaxDistance int
+	// Language of the subtitle rendition to download.
+	// If empty, all subtitle renditions are downloaded.
+	// It has no effect if the stream does not contain subtitles.
+	SubtitleLanguage string
 	// HTTP client.
 	// It defaults to a new http.Client with cookies enabled.
 	HTTPClient *http.Client
@@ -270,6 +278,14 @@ func (c *Client) OnDataKLV(track *Track, cb ClientOnDataKLVFunc) {
 	}
 }
 
+// OnDataWebVTT sets a callback that is called when a cue from a WebVTT
+// subtitle track is received.
+func (c *Client) OnDataWebVTT(track *Track, cb ClientOnDataWebVTTFunc) {
+	c.tracks[track].onWebVTTCue = func(cue *SubtitleCue) {
+		cb(cue.Start, cue.End, cue.Text)
+	}
+}
+
 var zero time.Time
 
 // AbsoluteTime returns the absolute timestamp of the last sample.
@@ -298,6 +314,7 @@ func (c *Client) runInner() error {
 		primaryPlaylistURL:        c.playlistURL,
 		startDistance:             c.StartDistance,
 		maxDistance:               c.MaxDistance,
+		subtitleLanguage:          c.SubtitleLanguage,
 		httpClient:                c.HTTPClient,
 		errGroup:                  errGroup,
 		onRequest:                 c.OnRequest,
@@ -321,8 +338,11 @@ func (c *Client) setTracks(tracks []*Track) (map[*Track]*clientTrack, error) {
 	c.tracks = make(map[*Track]*clientTrack)
 	for _, track := range tracks {
 		c.tracks[track] = &clientTrack{
-			track:  track,
-			onData: func(_, _ int64, _ [][]byte) {},
+			track: track,
+			onData: func(_, _ int64, _ [][]byte) {
+			},
+			onWebVTTCue: func(_ *SubtitleCue) {
+			},
 		}
 	}
 

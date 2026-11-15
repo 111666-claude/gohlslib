@@ -22,7 +22,8 @@ func checkSupport(codecs []string) bool {
 			!strings.HasPrefix(codec, "hvc1.") &&
 			!strings.HasPrefix(codec, "hev1.") &&
 			!strings.HasPrefix(codec, "mp4a.") &&
-			codec != "opus" {
+			codec != "opus" &&
+			codec != "wvtt" {
 			return false
 		}
 	}
@@ -127,6 +128,7 @@ type clientPrimaryDownloader struct {
 	primaryPlaylistURL        *url.URL
 	startDistance             int
 	maxDistance               int
+	subtitleLanguage          string
 	httpClient                *http.Client
 	errGroup                  *errgroup.Group
 	onRequest                 ClientOnRequestFunc
@@ -289,6 +291,53 @@ func (d *clientPrimaryDownloader) run(errGroupCtx context.Context) error {
 
 					streams = append(streams, renditionStream)
 				}
+			}
+		}
+
+		if leadingPlaylist.Subtitles != "" {
+			subtitlePlaylists := getRenditionsByGroup(plt.Renditions, leadingPlaylist.Subtitles)
+			if subtitlePlaylists == nil {
+				return fmt.Errorf("no playlist with Group ID \"%s\" found", leadingPlaylist.Subtitles)
+			}
+
+			for _, sub := range subtitlePlaylists {
+				if sub.Type != playlist.MultivariantRenditionTypeSubtitles || sub.URI == nil {
+					continue
+				}
+
+				if d.subtitleLanguage != "" && sub.Language != d.subtitleLanguage {
+					continue
+				}
+
+				var su *url.URL
+				su, err = clientAbsoluteURL(d.primaryPlaylistURL, *sub.URI)
+				if err != nil {
+					return err
+				}
+
+				renditionStream := &clientStreamDownloader{
+					isLeading:                false,
+					isSubtitle:               true,
+					onRequest:                d.onRequest,
+					startDistance:            d.startDistance,
+					maxDistance:              d.maxDistance,
+					httpClient:               d.httpClient,
+					onDownloadStreamPlaylist: d.onDownloadStreamPlaylist,
+					onDownloadSegment:        d.onDownloadSegment,
+					onDownloadPart:           d.onDownloadPart,
+					onDecodeError:            d.onDecodeError,
+					playlistURL:              su,
+					rendition:                sub,
+					errGroup:                 d.errGroup,
+					parent:                   d,
+				}
+				renditionStream.initialize()
+
+				d.errGroup.Go(func() error {
+					return renditionStream.run(errGroupCtx)
+				})
+
+				streams = append(streams, renditionStream)
 			}
 		}
 

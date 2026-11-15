@@ -78,6 +78,7 @@ type clientStreamDownloaderParent interface {
 
 type clientStreamDownloader struct {
 	isLeading                bool
+	isSubtitle               bool
 	startDistance            int
 	maxDistance              int
 	httpClient               *http.Client
@@ -119,7 +120,18 @@ func (d *clientStreamDownloader) run(errGroupCtx context.Context) error {
 	d.segmentQueue = &clientSegmentQueue{}
 	d.segmentQueue.initialize()
 
-	if d.firstPlaylist.Map != nil && d.firstPlaylist.Map.URI != "" {
+	if d.isSubtitle {
+		proc := &clientStreamProcessorWebVTT{
+			rendition:    d.rendition,
+			segmentQueue: d.segmentQueue,
+			errGroup:     d.errGroup,
+			parent:       d,
+		}
+
+		d.errGroup.Go(func() error {
+			return proc.run(errGroupCtx)
+		})
+	} else if d.firstPlaylist.Map != nil && d.firstPlaylist.Map.URI != "" {
 		initFile, err := d.downloadSegment(
 			errGroupCtx,
 			d.firstPlaylist.Map.URI,

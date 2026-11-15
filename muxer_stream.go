@@ -25,6 +25,7 @@ import (
 	"github.com/bluenviron/gohlslib/v2/pkg/codecs"
 	"github.com/bluenviron/gohlslib/v2/pkg/playlist"
 	"github.com/bluenviron/gohlslib/v2/pkg/storage"
+	"github.com/bluenviron/gohlslib/v2/pkg/webvtt"
 )
 
 func mediaPlaylistPath(streamID string) string {
@@ -112,6 +113,7 @@ type muxerStream struct {
 	id             string
 	isLeading      bool
 	isRendition    bool
+	isSubtitle     bool
 	name           string
 	language       string
 	isDefault      bool
@@ -123,8 +125,9 @@ type muxerStream struct {
 	mpegtsWriter           *mpegts.Writer    // mpegts only
 	segments               []muxerSegment
 	nextSegment            muxerSegment
-	nextPart               *muxerPart // low-latency only
-	initFilePresent        bool       // fmp4 only
+	nextPart               *muxerPart    // low-latency only
+	pendingCues            []*webvtt.Cue // subtitles only, before the first segment exists
+	initFilePresent        bool          // fmp4 only
 	segmentDeleteCount     int
 	closed                 bool
 	targetDuration         int
@@ -136,7 +139,11 @@ func (s *muxerStream) initialize() error {
 		track.stream = s
 	}
 
-	if s.variant == MuxerVariantMPEGTS {
+	switch {
+	case s.isSubtitle:
+		s.generateMediaPlaylist = s.generateMediaPlaylistWebVTT
+
+	case s.variant == MuxerVariantMPEGTS:
 		s.generateMediaPlaylist = s.generateMediaPlaylistMPEGTS
 
 		tracks := make([]*mpegts.Track, len(s.tracks))
@@ -149,7 +156,8 @@ func (s *muxerStream) initialize() error {
 		if err != nil {
 			return err
 		}
-	} else {
+
+	default:
 		s.generateMediaPlaylist = s.generateMediaPlaylistFMP4
 	}
 
@@ -242,6 +250,22 @@ func (s *muxerStream) populateMultivariantPlaylist(
 		mv.URI = uri
 	}
 
+	if s.isSubtitle {
+		mv.Subtitles = "subtitles"
+
+		pl.Renditions = append(pl.Renditions, &playlist.MultivariantRendition{
+			Type:       playlist.MultivariantRenditionTypeSubtitles,
+			GroupID:    "subtitles",
+			Name:       s.name,
+			Language:   s.language,
+			Autoselect: true,
+			Default:    s.isDefault,
+			URI:        &uri,
+		})
+
+		return nil
+	}
+
 	if s.isRendition {
 		mv.Audio = "audio"
 
@@ -270,6 +294,9 @@ func (s *muxerStream) populateMultivariantPlaylist(
 }
 
 func (s *muxerStream) hasContent() bool {
+	if s.isSubtitle {
+		return len(s.segments) >= 1
+	}
 	if s.variant == MuxerVariantFMP4 {
 		return len(s.segments) >= 2
 	}
@@ -320,7 +347,7 @@ func (s *muxerStream) handleMediaPlaylist(w http.ResponseWriter, r *http.Request
 
 	isDeltaUpdate := false
 
-	if s.variant == MuxerVariantLowLatency {
+	if s.variant == MuxerVariantLowLatency && !s.isSubtitle {
 		isDeltaUpdate = skip == "YES" || skip == "v2"
 
 		msnint, partint, err := parseMSNPart(msn, part)
@@ -582,6 +609,37 @@ func (s *muxerStream) generateMediaPlaylistFMP4(
 	return pl.Marshal()
 }
 
+func (s *muxerStream) generateMediaPlaylistWebVTT(
+	_ bool,
+	rawQuery string,
+) ([]byte, error) {
+	pl := &playlist.Media{
+		Version:        6,
+		TargetDuration: s.targetDuration,
+		MediaSequence:  s.segmentDeleteCount,
+	}
+
+	for _, sog := range s.segments {
+		seg, ok := sog.(*muxerSegmentWebVTT)
+		if !ok {
+			continue
+		}
+
+		u := seg.getPath()
+		if rawQuery != "" {
+			u += "?" + rawQuery
+		}
+
+		pl.Segments = append(pl.Segments, &playlist.MediaSegment{
+			DateTime: &seg.startNTP,
+			Duration: seg.getDuration(),
+			URI:      u,
+		})
+	}
+
+	return pl.Marshal()
+}
+
 func (s *muxerStream) generateAndCacheInitFile() error {
 	var init fmp4.Init
 	trackID := 1
@@ -633,7 +691,28 @@ func (s *muxerStream) createFirstSegment(
 	nextDTS time.Duration,
 	nextNTP time.Time,
 ) error {
-	if s.variant == MuxerVariantMPEGTS { //nolint:dupl
+	switch {
+	case s.isSubtitle:
+		seg := &muxerSegmentWebVTT{
+			prefix:   s.prefix,
+			streamID: s.id,
+			id:       s.nextSegmentID,
+			startNTP: nextNTP,
+			startDTS: nextDTS,
+		}
+		seg.initialize()
+		s.nextSegment = seg
+
+		// distribute cues that arrived before the first segment existed
+		pending := s.pendingCues
+		s.pendingCues = nil
+		for _, cue := range pending {
+			if cue.End > nextDTS.Milliseconds() {
+				seg.appendCue(cue)
+			}
+		}
+
+	case s.variant == MuxerVariantMPEGTS: //nolint:dupl
 		seg := &muxerSegmentMPEGTS{
 			segmentMaxSize: s.segmentMaxSize,
 			prefix:         s.prefix,
@@ -651,7 +730,8 @@ func (s *muxerStream) createFirstSegment(
 		s.nextSegment = seg
 
 		s.mpegtsSwitchableWriter.w = seg.bw
-	} else {
+
+	default:
 		seg := &muxerSegmentFMP4{
 			prefix:         s.prefix,
 			storageFactory: s.storageFactory,
@@ -686,6 +766,11 @@ func (s *muxerStream) rotateParts(
 	nextDTS time.Duration,
 	createNew bool,
 ) error {
+	// subtitle tracks are not split into parts
+	if s.isSubtitle {
+		return nil
+	}
+
 	s.nextPartID++
 
 	part := s.nextPart
@@ -787,10 +872,107 @@ func (s *muxerStream) rotateParts(
 	return nil
 }
 
+// addWebVTTCue distributes a cue (in shifted DTS domain, milliseconds)
+// to every allocated segment it overlaps, finalized or open.
+// If no segment exists yet, the cue is buffered until the first segment
+// is created (which happens lazily on the first media sample).
+func (s *muxerStream) addWebVTTCue(cue *webvtt.Cue) error {
+	if s.nextSegment == nil && len(s.segments) == 0 {
+		s.pendingCues = append(s.pendingCues, cue)
+		return nil
+	}
+
+	for _, seg := range s.segments {
+		vs, ok := seg.(*muxerSegmentWebVTT)
+		if !ok {
+			continue
+		}
+
+		// overlap: cue starts before the segment ends and ends after it starts
+		if cue.Start < vs.endDTS.Milliseconds() && cue.End > vs.startDTS.Milliseconds() {
+			vs.appendCue(cue)
+		}
+	}
+
+	if open, ok := s.nextSegment.(*muxerSegmentWebVTT); ok {
+		if cue.End > open.startDTS.Milliseconds() {
+			open.appendCue(cue)
+		}
+	}
+
+	return nil
+}
+
+func (s *muxerStream) rotateSegmentsWebVTT(
+	nextDTS time.Duration,
+	nextNTP time.Time,
+) error {
+	s.nextSegmentID++
+
+	segment := s.nextSegment.(*muxerSegmentWebVTT)
+	s.nextSegment = nil
+	segment.endDTS = nextDTS
+
+	s.segments = append(s.segments, segment)
+
+	s.server.registerPath(
+		segment.getPath(),
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Cache-Control", "public, max-age="+segmentMaxAge)
+			w.Header().Set("Content-Type", "text/vtt")
+			w.WriteHeader(http.StatusOK)
+			w.Write(segment.render())
+		})
+
+	// delete old segments
+	if len(s.segments) > s.segmentCount {
+		toDelete := s.segments[0]
+
+		// in VOD disk mode the evicted segment's content is now final:
+		// persist it before dropping it from the in-memory window
+		if vs, ok := toDelete.(*muxerSegmentWebVTT); ok &&
+			s.directory != "" && s.variant != MuxerVariantLowLatency {
+			err := os.WriteFile(filepath.Join(s.directory, vs.getPath()), vs.render(), 0o644)
+			if err != nil {
+				return err
+			}
+		}
+
+		toDelete.close()
+		s.server.unregisterPath(toDelete.getPath())
+		s.segments = s.segments[1:]
+		s.segmentDeleteCount++
+	}
+
+	// allocate the next segment
+	nextSeg := &muxerSegmentWebVTT{
+		prefix:   s.prefix,
+		streamID: s.id,
+		id:       s.nextSegmentID,
+		startNTP: nextNTP,
+		startDTS: nextDTS,
+	}
+	nextSeg.initialize()
+	s.nextSegment = nextSeg
+
+	// TARGETDURATION is an integer number of seconds and must be at least 1,
+	// even for short (sub-second) subtitle segments.
+	s.targetDuration = targetDuration(s.segments)
+	if s.targetDuration < 1 {
+		s.targetDuration = 1
+	}
+
+	return nil
+}
+
 func (s *muxerStream) rotateSegments(
 	nextDTS time.Duration,
 	nextNTP time.Time,
 ) error {
+	if s.isSubtitle {
+		return s.rotateSegmentsWebVTT(nextDTS, nextNTP)
+	}
+
 	if s.variant != MuxerVariantMPEGTS {
 		err := s.rotateParts(nextDTS, false)
 		if err != nil {

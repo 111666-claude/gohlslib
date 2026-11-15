@@ -17,6 +17,7 @@ import (
 	"github.com/bluenviron/gohlslib/v2/pkg/codecs"
 	"github.com/bluenviron/gohlslib/v2/pkg/playlist"
 	"github.com/bluenviron/gohlslib/v2/pkg/storage"
+	"github.com/bluenviron/gohlslib/v2/pkg/webvtt"
 )
 
 const (
@@ -113,6 +114,15 @@ func partPath(prefix string, streamID string, partID uint64) string {
 	return prefix + "_" + streamID + "_part" + strconv.FormatUint(partID, 10) + ".mp4"
 }
 
+func webvttSegmentPath(prefix string, streamID string, segmentID uint64) string {
+	return prefix + "_" + streamID + "_seg" + strconv.FormatUint(segmentID, 10) + ".vtt"
+}
+
+func codecIsWebVTT(c codecs.Codec) bool {
+	_, ok := c.(*codecs.WebVTT)
+	return ok
+}
+
 func codecRequiredClockRate(c codecs.Codec) int {
 	switch codec := c.(type) {
 	case *codecs.AV1:
@@ -138,6 +148,9 @@ func codecRequiredClockRate(c codecs.Codec) int {
 
 	case *codecs.KLV:
 		return 90000
+
+	case *codecs.WebVTT:
+		return webvtt.ClockRate
 	}
 
 	return 0
@@ -254,6 +267,10 @@ func (m *Muxer) Start() error {
 
 	if m.Variant == MuxerVariantMPEGTS {
 		for _, track := range m.Tracks {
+			if codecIsWebVTT(track.Codec) {
+				return fmt.Errorf("WebVTT tracks are not supported with the MPEG-TS muxer variant")
+			}
+
 			if track.Codec.IsVideo() {
 				if hasVideo {
 					return fmt.Errorf("the MPEG-TS variant of HLS supports a single video track only")
@@ -290,18 +307,35 @@ func (m *Muxer) Start() error {
 					return fmt.Errorf("only one video track is currently supported")
 				}
 				hasVideo = true
+			} else if codecIsWebVTT(track.Codec) {
+				// subtitle tracks are handled as standalone rendition streams
 			} else if _, ok := track.Codec.(*codecs.KLV); ok {
 				return fmt.Errorf("KLV tracks are only supported with the MPEG-TS muxer variant")
 			} else {
-				hasAudio = true //nolint:ineffassign,wastedassign
+				hasAudio = true
 			}
 		}
 	}
 
+	// subtitle tracks are renditions and cannot drive segment creation
+	if !hasVideo && !hasAudio {
+		return fmt.Errorf("at least one video or audio track must be provided")
+	}
+
 	hasDefaultAudio := false
+	hasDefaultSubtitles := false
 
 	for _, track := range m.Tracks {
-		if !track.Codec.IsVideo() && track.IsDefault {
+		if !track.IsDefault {
+			continue
+		}
+
+		if codecIsWebVTT(track.Codec) {
+			if hasDefaultSubtitles {
+				return fmt.Errorf("multiple default subtitle tracks are not supported")
+			}
+			hasDefaultSubtitles = true
+		} else if !track.Codec.IsVideo() {
 			if hasDefaultAudio {
 				return fmt.Errorf("multiple default audio tracks are not supported")
 			}
@@ -406,10 +440,14 @@ func (m *Muxer) Start() error {
 
 	default:
 		defaultAudioChosen := false
+		defaultSubtitleChosen := false
 
 		for i, track := range m.mtracks {
 			var id string
-			if track.Codec.IsVideo() {
+			isSubtitle := codecIsWebVTT(track.Codec)
+			if isSubtitle {
+				id = "subtitles" + strconv.FormatInt(int64(i+1), 10)
+			} else if track.Codec.IsVideo() {
 				id = "video" + strconv.FormatInt(int64(i+1), 10)
 			} else {
 				id = "audio" + strconv.FormatInt(int64(i+1), 10)
@@ -420,7 +458,16 @@ func (m *Muxer) Start() error {
 			name := ""
 
 			if isRendition {
-				if !hasDefaultAudio {
+				if isSubtitle {
+					if !hasDefaultSubtitles {
+						if !defaultSubtitleChosen {
+							defaultSubtitleChosen = true
+							isDefault = true
+						}
+					} else {
+						isDefault = track.IsDefault
+					}
+				} else if !hasDefaultAudio {
 					if !defaultAudioChosen {
 						defaultAudioChosen = true
 						isDefault = true
@@ -451,6 +498,7 @@ func (m *Muxer) Start() error {
 				id:             id,
 				isLeading:      track.isLeading,
 				isRendition:    isRendition,
+				isSubtitle:     isSubtitle,
 				name:           name,
 				language:       track.Language,
 				isDefault:      isDefault,
@@ -580,6 +628,22 @@ func (m *Muxer) WriteKLV(
 	return m.segmenter.writeKLV(m.mtracksByTrack[track], ntp, pts, data)
 }
 
+// WriteWebVTT writes a WebVTT subtitle cue.
+// start and end are durations on the media timeline, aligned with the
+// audio and video track timestamps. The cue is copied into every
+// WebVTT segment it overlaps, including segments that start inside the cue.
+func (m *Muxer) WriteWebVTT(
+	track *Track,
+	start time.Duration,
+	end time.Duration,
+	text string,
+) error {
+	if _, ok := track.Codec.(*codecs.WebVTT); !ok {
+		return fmt.Errorf("WriteWebVTT called with a non-WebVTT track")
+	}
+	return m.segmenter.writeWebVTT(m.mtracksByTrack[track], time.Time{}, start, end, text)
+}
+
 // Handle handles a HTTP request.
 // This can be safely called in parallel with Write*() and Close() methods.
 func (m *Muxer) Handle(w http.ResponseWriter, r *http.Request) {
@@ -679,6 +743,19 @@ func (m *Muxer) rotateSegmentsInner(
 
 func (m *Muxer) savePlaylists() error {
 	for _, stream := range m.streams {
+		// persist subtitle segments still held in the in-memory window
+		if stream.isSubtitle {
+			for _, seg := range stream.segments {
+				if vs, ok := seg.(*muxerSegmentWebVTT); ok {
+					err := os.WriteFile(
+						filepath.Join(m.Directory, vs.getPath()), vs.render(), 0o644)
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
+
 		byts, err := stream.generateMediaPlaylist(false, "")
 		if err != nil {
 			return err

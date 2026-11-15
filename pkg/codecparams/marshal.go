@@ -185,6 +185,9 @@ func Marshal(codec codecs.Codec) string {
 	case *codecs.MPEG4Audio:
 		// https://developer.mozilla.org/en-US/docs/Web/Media/Formats/codecs_parameter
 		return "mp4a.40." + strconv.FormatInt(int64(codec.Config.Type), 10)
+
+	case *codecs.WebVTT:
+		return "wvtt"
 	}
 
 	return ""
