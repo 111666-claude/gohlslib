@@ -1755,3 +1755,163 @@ func TestClientCookie(t *testing.T) {
 
 	<-segmentOk
 }
+
+func TestClientFMP4SegmentWithManyParts(t *testing.T) {
+	// regression test: a segment with more part-tracks than the size of the
+	// processing queue used to cause a deadlock between the stream processor
+	// and the track processors.
+
+	const (
+		partCount         = 12
+		expectedVideoRecv = 25
+		expectedAudioRecv = 24
+	)
+
+	videoRecv := make(chan struct{}, expectedVideoRecv)
+	audioRecv := make(chan struct{}, expectedAudioRecv)
+
+	httpServ := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/index.m3u8":
+				w.Header().Set("Content-Type", `application/vnd.apple.mpegurl`)
+				w.Write([]byte("#EXTM3U\n" +
+					"#EXT-X-VERSION:7\n" +
+					"#EXT-X-MEDIA-SEQUENCE:0\n" +
+					"#EXT-X-PLAYLIST-TYPE:VOD\n" +
+					"#EXT-X-INDEPENDENT-SEGMENTS\n" +
+					"#EXT-X-TARGETDURATION:6\n" +
+					"#EXT-X-MAP:URI=\"init.mp4\"\n" +
+					"#EXTINF:6,\n" +
+					"segment1.mp4\n" +
+					"#EXT-X-ENDLIST\n"))
+
+			case r.Method == http.MethodGet && r.URL.Path == "/init.mp4":
+				w.Header().Set("Content-Type", `video/mp4`)
+				err := mp4ToWriter(&fmp4.Init{
+					Tracks: []*fmp4.InitTrack{
+						{
+							ID:        99,
+							TimeScale: 90000,
+							Codec: &mp4codecs.H264{
+								SPS: testSPS,
+								PPS: testPPS,
+							},
+						},
+						{
+							ID:        98,
+							TimeScale: 44100,
+							Codec: &mp4codecs.MPEG4Audio{
+								Config: testConfig,
+							},
+						},
+					},
+				}, w)
+				require.NoError(t, err)
+
+			case r.Method == http.MethodGet && r.URL.Path == "/segment1.mp4":
+				w.Header().Set("Content-Type", `video/mp4`)
+
+				parts := make(fmp4.Parts, partCount)
+
+				for i := range partCount {
+					videoSamples := []*fmp4.Sample{{
+						Duration: 90000 / 30,
+						Payload: mustMarshalAVCC([][]byte{
+							{7, 1, 2, 3}, // SPS
+							{8},          // PPS
+							{5},          // IDR
+						}),
+					}, {
+						Duration: 90000 / 30,
+						Payload: mustMarshalAVCC([][]byte{
+							{1, 4, 5, 6},
+						}),
+					}}
+
+					if i == 0 {
+						videoSamples = append(videoSamples, &fmp4.Sample{
+							Duration: 90000 / 30,
+							Payload: mustMarshalAVCC([][]byte{
+								{1, 7, 8, 9},
+							}),
+						})
+					}
+
+					parts[i] = &fmp4.Part{
+						Tracks: []*fmp4.PartTrack{
+							{
+								ID:       99,
+								BaseTime: uint64(i) * 3 * 90000 / 30,
+								Samples:  videoSamples,
+							},
+							{
+								ID:       98,
+								BaseTime: uint64(i) * 2 * 44100 / 30,
+								Samples: []*fmp4.Sample{
+									{
+										Duration: 44100 / 30,
+										Payload:  []byte{1, 2, 3, 4},
+									},
+									{
+										Duration: 44100 / 30,
+										Payload:  []byte{5, 6, 7, 8},
+									},
+								},
+							},
+						},
+					}
+				}
+
+				err := mp4ToWriter(&parts, w)
+				require.NoError(t, err)
+			}
+		}),
+	}
+
+	ln, err := net.Listen("tcp", "localhost:5781")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	go httpServ.Serve(ln)
+	defer httpServ.Shutdown(context.Background())
+
+	tr := &http.Transport{}
+	defer tr.CloseIdleConnections()
+
+	var c *Client
+	c = &Client{
+		URI:        "http://localhost:5781/index.m3u8",
+		HTTPClient: &http.Client{Transport: tr},
+		OnTracks: func(tracks []*Track) error {
+			c.OnDataH26x(tracks[0], func(_ int64, _ int64, _ [][]byte) {
+				videoRecv <- struct{}{}
+			})
+			c.OnDataMPEG4Audio(tracks[1], func(_ int64, _ [][]byte) {
+				audioRecv <- struct{}{}
+			})
+
+			return nil
+		},
+	}
+
+	err = c.Start()
+	require.NoError(t, err)
+	defer c.Close()
+
+	for range expectedVideoRecv {
+		select {
+		case <-videoRecv:
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for video samples")
+		}
+	}
+
+	for range expectedAudioRecv {
+		select {
+		case <-audioRecv:
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for audio samples")
+		}
+	}
+}
