@@ -42,6 +42,13 @@ type clientStreamProcessorStreamDownloader interface {
 	onProcessorError(ctx context.Context, err error)
 }
 
+type pendingSampleMPEGTS struct {
+	track  *clientTrack
+	rawPTS int64
+	rawDTS int64
+	data   [][]byte
+}
+
 type clientStreamProcessorMPEGTS struct {
 	onDecodeError    ClientOnDecodeErrorFunc
 	isLeading        bool
@@ -53,10 +60,14 @@ type clientStreamProcessorMPEGTS struct {
 	switchableReader   *switchableReader
 	reader             *mpegts.Reader
 	trackProcessors    map[*Track]*clientTrackProcessorMPEGTS
+	clientStreamTracks []*clientTrack
 	curSegment         *segmentData
 	leadingTrackFound  bool
 	dateTimeProcessed  bool
-	clientStreamTracks []*clientTrack
+
+	// samples received before the first sample of the leading track,
+	// kept in their original interleaved order so that no packet is lost.
+	pendingSamples []*pendingSampleMPEGTS
 
 	chTrackProcessorDone chan struct{}
 }
@@ -98,6 +109,7 @@ func (p *clientStreamProcessorMPEGTS) processSegment(ctx context.Context, seg *s
 	p.curSegment = seg
 	p.leadingTrackFound = false
 	p.dateTimeProcessed = false
+	p.pendingSamples = nil
 
 	for {
 		err := p.reader.Read()
@@ -111,6 +123,13 @@ func (p *clientStreamProcessorMPEGTS) processSegment(ctx context.Context, seg *s
 
 	if !p.leadingTrackFound {
 		return fmt.Errorf("could not find data of leading track")
+	}
+
+	// deliver samples of non-leading tracks that arrived before the first
+	// sample of the leading track and were not consumed while reading
+	err := p.flushPendingSamples(ctx)
+	if err != nil {
+		return err
 	}
 
 	return p.joinTrackProcessors(ctx)
@@ -192,49 +211,45 @@ func (p *clientStreamProcessorMPEGTS) initializeReader(ctx context.Context, firs
 	for i, mpegtsTrack := range supportedTracks {
 		track := p.clientStreamTracks[i]
 		isLeadingTrack := (i == leadingTrackID)
-		var trackProc *clientTrackProcessorMPEGTS
 
 		processSample := func(rawPTS int64, rawDTS int64, data [][]byte) error {
-			if isLeadingTrack {
-				p.leadingTrackFound = true
-
-				if p.trackProcessors == nil {
-					err2 := p.initializeTrackProcessors(ctx, rawDTS)
-					if err2 != nil {
-						return err2
-					}
-				}
-			}
-
-			if trackProc == nil {
-				trackProc = p.trackProcessors[track.track]
-
-				// wait leading track before proceeding
-				if trackProc == nil {
+			if p.trackProcessors == nil {
+				if !isLeadingTrack {
+					// the leading track has not produced data yet: keep the
+					// sample instead of discarding it, it will be delivered
+					// once the leading track is available
+					p.pendingSamples = append(p.pendingSamples, &pendingSampleMPEGTS{
+						track:  track,
+						rawPTS: rawPTS,
+						rawDTS: rawDTS,
+						data:   data,
+					})
 					return nil
 				}
-			}
 
-			pts := leadingTimeConvMPEGTS(p.client).convert(rawPTS)
-			dts := leadingTimeConvMPEGTS(p.client).convert(rawDTS)
+				p.leadingTrackFound = true
 
-			if !p.dateTimeProcessed && p.isLeading && isLeadingTrack {
-				p.dateTimeProcessed = true
-
-				if p.curSegment.dateTime != nil {
-					leadingTimeConvMPEGTS(p.client).setNTP(*p.curSegment.dateTime, dts)
+				err2 := p.initializeTrackProcessors(ctx, rawDTS)
+				if err2 != nil {
+					return err2
 				}
-				leadingTimeConvMPEGTS(p.client).setLeadingNTPReceived()
+
+				// deliver the first sample of the leading track first, so that
+				// playback can start immediately, then drain the backlog of
+				// samples from the other tracks in its original interleaved order
+				err2 = p.processSample(ctx, track, rawPTS, rawDTS, data, true)
+				if err2 != nil {
+					return err2
+				}
+
+				return p.flushPendingSamples(ctx)
 			}
 
-			ntp := leadingTimeConvMPEGTS(p.client).getNTP(ctx, dts)
+			if isLeadingTrack {
+				p.leadingTrackFound = true
+			}
 
-			return trackProc.push(ctx, &procEntryMPEGTS{
-				pts:  pts,
-				dts:  dts,
-				ntp:  ntp,
-				data: data,
-			})
+			return p.processSample(ctx, track, rawPTS, rawDTS, data, isLeadingTrack)
 		}
 
 		switch track.track.Codec.(type) {
@@ -251,6 +266,52 @@ func (p *clientStreamProcessorMPEGTS) initializeReader(ctx context.Context, firs
 	}
 
 	return nil
+}
+
+// flushPendingSamples delivers, in the original interleaved order, all the
+// samples that arrived before the first sample of the leading track.
+func (p *clientStreamProcessorMPEGTS) flushPendingSamples(ctx context.Context) error {
+	for len(p.pendingSamples) != 0 {
+		entry := p.pendingSamples[0]
+		p.pendingSamples = p.pendingSamples[1:]
+
+		err := p.processSample(ctx, entry.track, entry.rawPTS, entry.rawDTS, entry.data, false)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (p *clientStreamProcessorMPEGTS) processSample(
+	ctx context.Context,
+	track *clientTrack,
+	rawPTS int64,
+	rawDTS int64,
+	data [][]byte,
+	isLeadingTrack bool,
+) error {
+	pts := leadingTimeConvMPEGTS(p.client).convert(rawPTS)
+	dts := leadingTimeConvMPEGTS(p.client).convert(rawDTS)
+
+	if !p.dateTimeProcessed && p.isLeading && isLeadingTrack {
+		p.dateTimeProcessed = true
+
+		if p.curSegment.dateTime != nil {
+			leadingTimeConvMPEGTS(p.client).setNTP(*p.curSegment.dateTime, dts)
+		}
+		leadingTimeConvMPEGTS(p.client).setLeadingNTPReceived()
+	}
+
+	ntp := leadingTimeConvMPEGTS(p.client).getNTP(ctx, dts)
+
+	return p.trackProcessors[track.track].push(ctx, &procEntryMPEGTS{
+		pts:  pts,
+		dts:  dts,
+		ntp:  ntp,
+		data: data,
+	})
 }
 
 func (p *clientStreamProcessorMPEGTS) initializeTrackProcessors(

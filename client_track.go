@@ -27,11 +27,6 @@ func (t *clientTrack) handleData(
 	ntp *time.Time,
 	data [][]byte,
 ) error {
-	// silently discard packets prior to the first packet of the leading track
-	if pts < 0 {
-		return nil
-	}
-
 	// synchronize time
 	elapsed := time.Since(t.startSystem)
 	dtsDuration := timestampToDuration(dts, t.track.ClockRate)
