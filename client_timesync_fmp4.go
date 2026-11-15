@@ -3,6 +3,7 @@ package gohlslib
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -26,6 +27,13 @@ type clientTimeSyncFMP4 struct {
 
 	startRTC time.Time
 	startDTS time.Duration
+
+	// the time sync is shared by all the track processors of a stream and the
+	// stream processor itself (NTP anchor). The conversion is currently
+	// stateless, but serialize accesses anyway so concurrent readers cannot
+	// observe a partially updated state and the two implementations expose the
+	// same concurrency contract.
+	mutex sync.Mutex
 }
 
 func (ts *clientTimeSyncFMP4) initialize() {
@@ -34,6 +42,9 @@ func (ts *clientTimeSyncFMP4) initialize() {
 }
 
 func (ts *clientTimeSyncFMP4) convert(v uint64, timeScale uint32) time.Duration {
+	ts.mutex.Lock()
+	defer ts.mutex.Unlock()
+
 	return durationMp4ToGo(v, timeScale) - ts.startDTS
 }
 
