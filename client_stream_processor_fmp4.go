@@ -168,6 +168,12 @@ func (p *clientStreamProcessorFMP4) processSegment(errGroupCtx context.Context, 
 		p.timeConv.setLeadingNTPReceived()
 	}
 
+	if seg.catchUp {
+		for _, trackProc := range p.trackProcessors {
+			trackProc.track.setCatchUp(true)
+		}
+	}
+
 	p.segmentWaitGroup = &sync.WaitGroup{}
 
 	for _, part := range parts {
@@ -195,6 +201,14 @@ func (p *clientStreamProcessorFMP4) processSegment(errGroupCtx context.Context, 
 	}
 
 	p.segmentWaitGroup.Wait()
+
+	if seg.catchUp {
+		for _, trackProc := range p.trackProcessors {
+			trackProc.track.setCatchUp(false)
+		}
+	}
+
+	p.segmentQueue.markProcessed()
 
 	return nil
 }

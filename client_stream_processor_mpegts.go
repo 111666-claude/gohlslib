@@ -99,6 +99,12 @@ func (p *clientStreamProcessorMPEGTS) processSegment(errGroupCtx context.Context
 	p.leadingTrackFound = false
 	p.dateTimeProcessed = false
 
+	if seg.catchUp {
+		for _, trackProc := range p.trackProcessors {
+			trackProc.track.setCatchUp(true)
+		}
+	}
+
 	for {
 		err := p.reader.Read()
 		if err != nil {
@@ -113,7 +119,18 @@ func (p *clientStreamProcessorMPEGTS) processSegment(errGroupCtx context.Context
 		return fmt.Errorf("could not find data of leading track")
 	}
 
-	return p.joinTrackProcessors(errGroupCtx)
+	err := p.joinTrackProcessors(errGroupCtx)
+	if err != nil {
+		return err
+	}
+
+	if seg.catchUp {
+		for _, trackProc := range p.trackProcessors {
+			trackProc.track.setCatchUp(false)
+		}
+	}
+
+	return nil
 }
 
 func (p *clientStreamProcessorMPEGTS) joinTrackProcessors(errGroupCtx context.Context) error {
@@ -131,6 +148,8 @@ func (p *clientStreamProcessorMPEGTS) joinTrackProcessors(errGroupCtx context.Co
 			return nil
 		}
 	}
+
+	p.segmentQueue.markProcessed()
 
 	return nil
 }

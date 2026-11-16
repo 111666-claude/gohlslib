@@ -10,77 +10,97 @@ type segmentData struct {
 	dateTime *time.Time
 	payload  []byte
 	err      error
+	// catchUp is true when this segment starts a target-latency catch up:
+	// the output clock must be re-anchored so that the segment and the
+	// buffered media are delivered immediately instead of at real-time pace.
+	catchUp bool
 }
 
+// clientSegmentQueue stores the segments downloaded by the stream downloader
+// and feeds them to the stream processor. It supports discarding queued
+// segments that have been superseded by a target-latency catch up, so that the
+// downloader is never blocked by media that is no longer meant to be played.
 type clientSegmentQueue struct {
-	mutex   sync.Mutex
+	mutex   sync.Cond
 	queue   []*segmentData
-	didPush chan struct{}
-	didPull chan struct{}
+	pending int
 }
 
 func (q *clientSegmentQueue) initialize() {
-	q.didPush = make(chan struct{})
-	q.didPull = make(chan struct{})
+	q.mutex.L = &sync.Mutex{}
 }
 
 func (q *clientSegmentQueue) push(seg *segmentData) {
-	q.mutex.Lock()
-
-	queueWasEmpty := (len(q.queue) == 0)
+	q.mutex.L.Lock()
 	q.queue = append(q.queue, seg)
-
-	if queueWasEmpty {
-		close(q.didPush)
-		q.didPush = make(chan struct{})
-	}
-
-	q.mutex.Unlock()
+	q.pending++
+	q.mutex.Broadcast()
+	q.mutex.L.Unlock()
 }
 
-func (q *clientSegmentQueue) waitUntilSizeIsBelow(errGroupCtx context.Context, n int) bool {
-	q.mutex.Lock()
+// discardQueued drops every segment still waiting to be processed and returns
+// the number of segments that were dropped. It is used after a catch up, when
+// the queued media has become stale.
+func (q *clientSegmentQueue) discardQueued() int {
+	q.mutex.L.Lock()
+	dropped := len(q.queue)
+	q.queue = nil
+	q.pending -= dropped
+	q.mutex.Broadcast()
+	q.mutex.L.Unlock()
+	return dropped
+}
 
-	for len(q.queue) > n {
-		didPullCopy := q.didPull
+// waitUntilPendingIsBelow blocks while the number of downloaded but not yet
+// fully processed segments is above n.
+func (q *clientSegmentQueue) waitUntilPendingIsBelow(errGroupCtx context.Context, n int) bool {
+	stop := context.AfterFunc(errGroupCtx, func() {
+		q.mutex.L.Lock()
+		q.mutex.Broadcast()
+		q.mutex.L.Unlock()
+	})
+	defer stop()
 
-		q.mutex.Unlock()
-
-		select {
-		case <-didPullCopy:
-		case <-errGroupCtx.Done():
-			return false
-		}
-
-		q.mutex.Lock()
+	q.mutex.L.Lock()
+	for q.pending > n && errGroupCtx.Err() == nil {
+		q.mutex.Wait()
 	}
+	q.mutex.L.Unlock()
 
-	q.mutex.Unlock()
-	return true
+	return errGroupCtx.Err() == nil
 }
 
 func (q *clientSegmentQueue) pull(errGroupCtx context.Context) (*segmentData, bool) {
-	q.mutex.Lock()
+	// abort the wait when the context is canceled
+	stop := context.AfterFunc(errGroupCtx, func() {
+		q.mutex.L.Lock()
+		q.mutex.Broadcast()
+		q.mutex.L.Unlock()
+	})
+	defer stop()
 
-	for len(q.queue) == 0 {
-		didPush := q.didPush
-		q.mutex.Unlock()
+	q.mutex.L.Lock()
+	for len(q.queue) == 0 && errGroupCtx.Err() == nil {
+		q.mutex.Wait()
+	}
 
-		select {
-		case <-didPush:
-		case <-errGroupCtx.Done():
-			return nil, false
-		}
-
-		q.mutex.Lock()
+	if errGroupCtx.Err() != nil {
+		q.mutex.L.Unlock()
+		return nil, false
 	}
 
 	var seg *segmentData
 	seg, q.queue = q.queue[0], q.queue[1:]
+	q.mutex.L.Unlock()
 
-	close(q.didPull)
-	q.didPull = make(chan struct{})
-
-	q.mutex.Unlock()
 	return seg, true
+}
+
+// markProcessed decrements the number of segments that have been downloaded
+// but not fully processed yet.
+func (q *clientSegmentQueue) markProcessed() {
+	q.mutex.L.Lock()
+	q.pending--
+	q.mutex.Broadcast()
+	q.mutex.L.Unlock()
 }

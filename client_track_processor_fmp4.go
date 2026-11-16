@@ -88,7 +88,7 @@ func (t *clientTrackProcessorFMP4) initialize() error {
 		}
 	}
 
-	t.queue = make(chan *procEntryFMP4)
+	t.queue = make(chan *procEntryFMP4, clientMPEGTSSampleQueueSize)
 
 	return nil
 }

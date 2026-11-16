@@ -2,6 +2,7 @@ package gohlslib
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/bluenviron/gohlslib/v2/pkg/playlist"
 )
+
+var errLowLatencyUnavailable = errors.New("low-latency tags are no longer available")
 
 func findSegmentWithInvPosition(segments []*playlist.MediaSegment, invPos int) (*playlist.MediaSegment, int) {
 	index := len(segments) - invPos
@@ -80,6 +83,7 @@ type clientStreamDownloader struct {
 	isLeading                bool
 	startDistance            int
 	maxDistance              int
+	targetLatency            time.Duration
 	httpClient               *http.Client
 	onRequest                ClientOnRequestFunc
 	onDownloadStreamPlaylist ClientOnDownloadStreamPlaylistFunc
@@ -94,6 +98,12 @@ type clientStreamDownloader struct {
 
 	segmentQueue *clientSegmentQueue
 	curSegmentID *int
+
+	// lastPreloadURI is the URI of the media last delivered through the
+	// preload hint. It is used when falling back from low-latency to the
+	// real-time loop, so the same media is not delivered a second time.
+	lastPreloadURI     string
+	skipPreloadSegment bool
 
 	// out
 	chTracks chan []*Track
@@ -164,6 +174,11 @@ func (d *clientStreamDownloader) run(errGroupCtx context.Context) error {
 		d.firstPlaylist.ServerControl.CanBlockReload &&
 		d.firstPlaylist.PreloadHint != nil {
 		err = d.runLowLatency(errGroupCtx)
+		// a playlist that lost the low-latency tags is handled as a
+		// real-time (traditional) playlist fallback
+		if errors.Is(err, errLowLatencyUnavailable) {
+			err = d.runTraditional(errGroupCtx)
+		}
 	} else {
 		err = d.runTraditional(errGroupCtx)
 	}
@@ -185,6 +200,8 @@ func (d *clientStreamDownloader) runLowLatency(errGroupCtx context.Context) erro
 			return err
 		}
 
+		d.lastPreloadURI = pl.PreloadHint.URI
+
 		d.segmentQueue.push(&segmentData{
 			dateTime: dateTimeOfPreloadHint(pl),
 			payload:  byts,
@@ -195,14 +212,30 @@ func (d *clientStreamDownloader) runLowLatency(errGroupCtx context.Context) erro
 			return err
 		}
 
-		if pl.PreloadHint == nil {
-			return fmt.Errorf("preload hint disappeared")
+		// the server stopped providing low-latency tags: fall back to the
+		// real-time playlist loop. The cursor is anchored on the last segment
+		// in the list; the segment delivered through the preload hint is
+		// skipped on the first traditional iteration so media is not delivered
+		// twice.
+		if pl.ServerControl == nil ||
+			!pl.ServerControl.CanBlockReload ||
+			pl.PreloadHint == nil {
+			anchorPos := len(pl.Segments) - 1
+			d.curSegmentID = new(pl.MediaSequence + anchorPos)
+			// the segment delivered through the preload hint must be skipped by
+			// the real-time loop to avoid delivering it twice
+			d.skipPreloadSegment = true
+			return errLowLatencyUnavailable
 		}
 	}
 }
 
 func (d *clientStreamDownloader) runTraditional(errGroupCtx context.Context) error {
 	pl := d.firstPlaylist
+
+	if d.targetLatency != 0 {
+		return d.runTraditionalWithTarget(errGroupCtx, pl)
+	}
 
 	for {
 		seg, payload, err := d.downloadNextSegment(errGroupCtx, pl)
@@ -215,7 +248,7 @@ func (d *clientStreamDownloader) runTraditional(errGroupCtx context.Context) err
 			payload:  payload,
 		})
 
-		ok := d.segmentQueue.waitUntilSizeIsBelow(errGroupCtx, 1)
+		ok := d.segmentQueue.waitUntilPendingIsBelow(errGroupCtx, 1)
 		if !ok {
 			return fmt.Errorf("terminated")
 		}
@@ -225,6 +258,117 @@ func (d *clientStreamDownloader) runTraditional(errGroupCtx context.Context) err
 			return err
 		}
 	}
+}
+
+// runTraditionalWithTarget drives the playlist with a target latency.
+//
+// The downloader keeps the number of downloaded-but-unprocessed segments
+// bounded by the target latency, so the processing pipeline is never flooded
+// while still allowing a small backlog. After every segment the playlist is
+// reloaded: when the playback position has fallen behind the target, the
+// cursor jumps forward, the stale backlog is discarded (never delivered
+// twice) and the jump segment is processed immediately so the output clock is
+// re-anchored and the client converges back to the target. Discontinuities are
+// never crossed.
+func (d *clientStreamDownloader) runTraditionalWithTarget(
+	errGroupCtx context.Context,
+	pl *playlist.Media,
+) error {
+	maxPending := d.maxTargetQueueSize(pl)
+
+	for {
+		seg, segPos, jumped, err := d.downloadNextSegmentWithTarget(pl)
+		if err != nil {
+			if errors.Is(err, ErrClientEOS) {
+				return err
+			}
+
+			// the next segment is not available yet (the playlist is frozen,
+			// for example during a short network stall): wait for the next
+			// reload window and keep polling instead of terminating, so
+			// playback can resume and catch up once new media is published
+			select {
+			case <-time.After(d.playlistReloadInterval(pl)):
+			case <-errGroupCtx.Done():
+				return fmt.Errorf("terminated")
+			}
+
+			pl, err = d.downloadPlaylist(errGroupCtx, false)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+
+		if jumped {
+			// every segment still queued for playback has been superseded.
+			// The segment currently being processed is left untouched so the
+			// output timeline stays contiguous.
+			d.segmentQueue.discardQueued()
+		}
+
+		// when coming from a low-latency fallback, the media already delivered
+		// through the preload hint is skipped without being downloaded again
+		if d.skipPreloadSegment && seg.URI == d.lastPreloadURI {
+			d.skipPreloadSegment = false
+			d.curSegmentID = new(pl.MediaSequence + segPos)
+			pl, err = d.downloadPlaylist(errGroupCtx, false)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		d.skipPreloadSegment = false
+
+		payload, err := d.downloadSegment(errGroupCtx, seg.URI,
+			new(segmentByteRangeStart(pl.Segments, segPos)), seg.ByteRangeLength)
+		if err != nil {
+			return err
+		}
+
+		d.curSegmentID = new(pl.MediaSequence + segPos)
+
+		d.segmentQueue.push(&segmentData{
+			dateTime: seg.DateTime,
+			payload:  payload,
+			catchUp:  jumped,
+		})
+
+		// Bound the backlog by the target latency. A catch-up segment is
+		// processed without real-time pacing, so the backlog drains promptly
+		// and the downloader can resume reloading the playlist.
+		ok := d.segmentQueue.waitUntilPendingIsBelow(errGroupCtx, maxPending)
+		if !ok {
+			return fmt.Errorf("terminated")
+		}
+
+		pl, err = d.downloadPlaylist(errGroupCtx, false)
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// maxTargetQueueSize returns the maximum number of downloaded but not yet
+// fully processed segments, derived from the target latency.
+func (d *clientStreamDownloader) maxTargetQueueSize(pl *playlist.Media) int {
+	segmentDuration := time.Duration(pl.TargetDuration) * time.Second
+
+	size := int(d.targetLatency/segmentDuration) + 1
+
+	return max(size, 2)
+}
+
+// playlistReloadInterval returns the time to wait before reloading a playlist
+// that does not yet contain the next segment. It follows the target duration
+// advertised by the playlist, capped to a reasonable range.
+func (d *clientStreamDownloader) playlistReloadInterval(pl *playlist.Media) time.Duration {
+	interval := time.Duration(pl.TargetDuration) * time.Second
+	interval = min(interval, time.Second)
+	if interval <= 0 {
+		interval = time.Second
+	}
+	return interval
 }
 
 func (d *clientStreamDownloader) downloadPlaylist(
@@ -358,9 +502,11 @@ func (d *clientStreamDownloader) downloadNextSegment(
 	var seg *playlist.MediaSegment
 	var segPos int
 
+	isVOD := (d.firstPlaylist.PlaylistType != nil &&
+		*d.firstPlaylist.PlaylistType == playlist.MediaPlaylistTypeVOD) || d.firstPlaylist.Endlist
+
 	if d.curSegmentID == nil {
-		if (d.firstPlaylist.PlaylistType != nil &&
-			*d.firstPlaylist.PlaylistType == playlist.MediaPlaylistTypeVOD) || d.firstPlaylist.Endlist {
+		if isVOD {
 			// VOD stream: start from the beginning
 			if len(pl.Segments) == 0 {
 				return nil, nil, fmt.Errorf("no segments found")
@@ -397,6 +543,64 @@ func (d *clientStreamDownloader) downloadNextSegment(
 	}
 
 	return seg, byts, nil
+}
+
+// downloadNextSegmentWithTarget implements the target-latency policy: the
+// first segment is chosen so that its edge distance matches the target, while
+// later iterations keep playing sequentially unless the distance grows beyond
+// the target by more than the current segment duration. In that case the
+// cursor jumps forward to the segment closest to the target, without ever
+// crossing a discontinuity or requesting a segment twice; the returned
+// jumped flag is true when such a jump happened.
+func (d *clientStreamDownloader) downloadNextSegmentWithTarget(
+	pl *playlist.Media,
+) (*playlist.MediaSegment, int, bool, error) {
+	if len(pl.Segments) == 0 {
+		return nil, 0, false, fmt.Errorf("no segments found")
+	}
+
+	if d.curSegmentID == nil {
+		segPos := initialSegmentForTarget(pl, d.targetLatency)
+		return pl.Segments[segPos], segPos, false, nil
+	}
+
+	curSeg, curPos, _ := findSegmentWithID(pl.MediaSequence, pl.Segments, *d.curSegmentID)
+	if curSeg == nil {
+		// the segment being played has been removed from the playlist:
+		// restart from the safe boundary instead of failing, while still
+		// refusing to cross a discontinuity
+		segPos := maxSafeSegmentPos(pl)
+		for pos := 0; pos <= segPos; pos++ {
+			if pl.Segments[pos].Discontinuity {
+				segPos = pos
+				break
+			}
+		}
+		return pl.Segments[segPos], segPos, true, nil
+	}
+
+	nextPos := curPos + 1
+	if nextPos >= len(pl.Segments) {
+		if pl.Endlist {
+			return nil, 0, false, ErrClientEOS
+		}
+		return nil, 0, false, fmt.Errorf("next segment not found or not ready yet")
+	}
+
+	// keep playing sequentially while within one segment duration of the
+	// target latency
+	if segmentEdgeDistance(pl, nextPos) <= d.targetLatency+curSeg.Duration {
+		return pl.Segments[nextPos], nextPos, false, nil
+	}
+
+	// playback is lagging behind: jump forward to the segment closest to the
+	// target, clamped by the safe boundary and discontinuities
+	catchupPos := catchupSegmentPos(pl, curPos, d.targetLatency)
+	if catchupPos == curPos {
+		return pl.Segments[nextPos], nextPos, false, nil
+	}
+
+	return pl.Segments[catchupPos], catchupPos, true, nil
 }
 
 func (d *clientStreamDownloader) startStreaming(

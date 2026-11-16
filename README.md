@@ -16,6 +16,7 @@ Features:
   - Read a single video track and/or multiple audio tracks
   - Read tracks encoded with AV1, VP9, H265, H264, Opus, FLAC, MPEG-4 Audio (AAC)
   - Get absolute timestamp of incoming data
+  - Configure a target latency to catch up with the live edge after a network stall
 
 - Muxer
   - Generate streams in MPEG-TS, fMP4 or Low-latency format

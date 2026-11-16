@@ -11,6 +11,11 @@ type clientTrack struct {
 	onData           func(pts int64, dts int64, data [][]byte)
 	lastAbsoluteTime *time.Time
 	startSystem      time.Time
+
+	// catchUp is true while the client is draining a backlog after a
+	// target-latency jump. In that state samples are delivered immediately
+	// instead of being paced against the system clock.
+	catchUp bool
 }
 
 func (t *clientTrack) absoluteTime() (time.Time, bool) {
@@ -18,6 +23,13 @@ func (t *clientTrack) absoluteTime() (time.Time, bool) {
 		return zero, false
 	}
 	return *t.lastAbsoluteTime, true
+}
+
+// setCatchUp enables or disables the catch-up mode. When enabled, the output
+// clock is re-anchored on the current media position so that subsequent
+// samples follow the new timeline without delivering stale media.
+func (t *clientTrack) setCatchUp(enabled bool) {
+	t.catchUp = enabled
 }
 
 func (t *clientTrack) handleData(
@@ -32,9 +44,19 @@ func (t *clientTrack) handleData(
 		return nil
 	}
 
+	dtsDuration := timestampToDuration(dts, t.track.ClockRate)
+
+	// while catching up, deliver samples immediately and keep the output
+	// clock anchored to the media timeline
+	if t.catchUp {
+		t.startSystem = time.Now().Add(-dtsDuration)
+		t.lastAbsoluteTime = ntp
+		t.onData(pts, dts, data)
+		return nil
+	}
+
 	// synchronize time
 	elapsed := time.Since(t.startSystem)
-	dtsDuration := timestampToDuration(dts, t.track.ClockRate)
 	if dtsDuration > elapsed {
 		diff := dtsDuration - elapsed
 		if diff > clientMaxDTSSystemDiff {
@@ -46,6 +68,11 @@ func (t *clientTrack) handleData(
 		case <-errGroupCtx.Done():
 			return fmt.Errorf("terminated")
 		}
+	} else if elapsed-dtsDuration > clientCatchUpReanchorThreshold {
+		// the playback position jumped forward (target-latency catch up):
+		// re-anchor the system clock so the new timeline is followed without
+		// delivering stale samples
+		t.startSystem = time.Now().Add(-dtsDuration)
 	}
 
 	t.lastAbsoluteTime = ntp

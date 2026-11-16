@@ -23,9 +23,12 @@ const (
 	clientMPEGTSSampleQueueSize  = 100
 	clientMaxMPEGTSQueuedSamples = 1000
 	clientMaxDTSSystemDiff       = 10 * time.Second
-	clientMaxInboundPlaylistSize = 1 * 1024 * 1024
-	clientMaxInboundSegmentSize  = 100 * 1024 * 1024
-	clientMaxInboundPartSize     = 10 * 1024 * 1024
+	// a forward jump larger than this is treated as a target-latency catch up
+	// rather than ordinary clock drift, and the output clock is re-anchored
+	clientCatchUpReanchorThreshold = 2 * time.Second
+	clientMaxInboundPlaylistSize   = 1 * 1024 * 1024
+	clientMaxInboundSegmentSize    = 100 * 1024 * 1024
+	clientMaxInboundPartSize       = 10 * 1024 * 1024
 )
 
 // ErrClientEOS is returned by Wait() when the stream has ended.
@@ -91,11 +94,25 @@ type Client struct {
 	// Start distance from the end of the playlist,
 	// expressed as number of segments.
 	// It defaults to 3.
+	// It is ignored when TargetLatency is set.
 	StartDistance int
 	// Maximum distance from the end of the playlist,
 	// expressed as number of segments.
 	// It defaults to 5.
+	// It is ignored when TargetLatency is set.
 	MaxDistance int
+	// TargetLatency is the target distance between the playback position and
+	// the live edge, expressed as a duration.
+	// When set, the client estimates the edge position from the part and
+	// segment durations (and from the server control information) and, if
+	// playback falls behind the target by more than one segment, it jumps
+	// forward to the safe boundary closest to the target.
+	// Jumps never deliver segments twice and never cross discontinuities.
+	// A target smaller than the distance of the safest available segment is
+	// clamped to that segment.
+	// When zero, the client uses the legacy behavior based on StartDistance
+	// and MaxDistance.
+	TargetLatency time.Duration
 	// HTTP client.
 	// It defaults to a new http.Client with cookies enabled.
 	HTTPClient *http.Client
@@ -135,6 +152,9 @@ type Client struct {
 
 // Start starts the client.
 func (c *Client) Start() error {
+	if c.TargetLatency < 0 {
+		return fmt.Errorf("TargetLatency must be a positive duration")
+	}
 	if c.StartDistance == 0 {
 		c.StartDistance = 3
 	}
@@ -298,6 +318,7 @@ func (c *Client) runInner() error {
 		primaryPlaylistURL:        c.playlistURL,
 		startDistance:             c.StartDistance,
 		maxDistance:               c.MaxDistance,
+		targetLatency:             c.TargetLatency,
 		httpClient:                c.HTTPClient,
 		errGroup:                  errGroup,
 		onRequest:                 c.OnRequest,
