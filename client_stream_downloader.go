@@ -81,6 +81,7 @@ type clientStreamDownloader struct {
 	startDistance            int
 	maxDistance              int
 	httpClient               *http.Client
+	retryConfig              *clientRetryConfig
 	onRequest                ClientOnRequestFunc
 	onDownloadStreamPlaylist ClientOnDownloadStreamPlaylistFunc
 	onDownloadSegment        ClientOnDownloadSegmentFunc
@@ -275,34 +276,13 @@ func (d *clientStreamDownloader) downloadPreloadHint(
 
 	d.onDownloadPart(u.String())
 
-	req, err := http.NewRequestWithContext(errGroupCtx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
+	var rangeHeader string
 	if preloadHint.ByteRangeLength != nil {
-		req.Header.Add("Range", "bytes="+strconv.FormatUint(preloadHint.ByteRangeStart, 10)+
-			"-"+strconv.FormatUint(preloadHint.ByteRangeStart+*preloadHint.ByteRangeLength-1, 10))
+		rangeHeader = "bytes=" + strconv.FormatUint(preloadHint.ByteRangeStart, 10) +
+			"-" + strconv.FormatUint(preloadHint.ByteRangeStart+*preloadHint.ByteRangeLength-1, 10)
 	}
 
-	d.onRequest(req)
-
-	res, err := d.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusPartialContent {
-		return nil, fmt.Errorf("bad status code: %d", res.StatusCode)
-	}
-
-	byts, err := io.ReadAll(&limitedreader.Reader{R: res.Body, N: clientMaxInboundPartSize})
-	if err != nil {
-		return nil, err
-	}
-
-	return byts, nil
+	return d.downloadWithRetry(errGroupCtx, u.String(), rangeHeader, clientMaxInboundPartSize)
 }
 
 func (d *clientStreamDownloader) downloadSegment(
@@ -318,37 +298,87 @@ func (d *clientStreamDownloader) downloadSegment(
 
 	d.onDownloadSegment(u.String())
 
-	req, err := http.NewRequestWithContext(errGroupCtx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
+	var rangeHeader string
 	if length != nil {
 		if start == nil {
 			start = new(uint64(0))
 		}
-		req.Header.Add("Range", "bytes="+strconv.FormatUint(*start, 10)+
-			"-"+strconv.FormatUint(*start+*length-1, 10))
+		rangeHeader = "bytes=" + strconv.FormatUint(*start, 10) +
+			"-" + strconv.FormatUint(*start+*length-1, 10)
+	}
+
+	return d.downloadWithRetry(errGroupCtx, u.String(), rangeHeader, clientMaxInboundSegmentSize)
+}
+
+// downloadWithRetry downloads a segment or part, retrying transient failures
+// according to the client retry policy. The download callbacks fire once per
+// logical download; OnRequest fires once per HTTP attempt. On success the
+// payload is delivered exactly once.
+func (d *clientStreamDownloader) downloadWithRetry(
+	errGroupCtx context.Context,
+	rawURL string,
+	rangeHeader string,
+	maxSize int64,
+) ([]byte, error) {
+	for attempt := 1; ; attempt++ {
+		byts, status, retryAfter, err := d.downloadOnce(
+			errGroupCtx, rawURL, rangeHeader, maxSize)
+		if err == nil {
+			return byts, nil
+		}
+
+		if !d.retryConfig.canRetry(attempt, status, err) {
+			if status != 0 {
+				return nil, fmt.Errorf("bad status code: %d", status)
+			}
+
+			return nil, err
+		}
+
+		delay := d.retryConfig.backoff(attempt, retryAfter, time.Now())
+		if !sleepWithContext(errGroupCtx, delay) {
+			return nil, fmt.Errorf("terminated")
+		}
+	}
+}
+
+// downloadOnce performs a single HTTP attempt. The returned status is zero
+// when the failure happened before receiving response headers, and the
+// response body is always closed before returning.
+func (d *clientStreamDownloader) downloadOnce(
+	errGroupCtx context.Context,
+	rawURL string,
+	rangeHeader string,
+	maxSize int64,
+) ([]byte, int, string, error) {
+	req, err := http.NewRequestWithContext(errGroupCtx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, 0, "", err
+	}
+
+	if rangeHeader != "" {
+		req.Header.Add("Range", rangeHeader)
 	}
 
 	d.onRequest(req)
 
 	res, err := d.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, "", err
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusPartialContent {
-		return nil, fmt.Errorf("bad status code: %d", res.StatusCode)
+		return nil, res.StatusCode, res.Header.Get("Retry-After"),
+			fmt.Errorf("bad status code: %d", res.StatusCode)
 	}
 
-	byts, err := io.ReadAll(&limitedreader.Reader{R: res.Body, N: clientMaxInboundSegmentSize})
+	byts, err := io.ReadAll(&limitedreader.Reader{R: res.Body, N: maxSize})
 	if err != nil {
-		return nil, err
+		return nil, 0, "", err
 	}
 
-	return byts, nil
+	return byts, res.StatusCode, "", nil
 }
 
 func (d *clientStreamDownloader) downloadNextSegment(

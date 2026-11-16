@@ -99,6 +99,10 @@ type Client struct {
 	// HTTP client.
 	// It defaults to a new http.Client with cookies enabled.
 	HTTPClient *http.Client
+	// Retry policy for transient failures (429, 5xx and retriable
+	// network errors) of segment and low-latency part downloads.
+	// It defaults to nil, which disables retries.
+	Retry *ClientRetryPolicy
 
 	//
 	// callbacks (all optional)
@@ -299,6 +303,7 @@ func (c *Client) runInner() error {
 		startDistance:             c.StartDistance,
 		maxDistance:               c.MaxDistance,
 		httpClient:                c.HTTPClient,
+		retryConfig:               c.Retry.normalize(),
 		errGroup:                  errGroup,
 		onRequest:                 c.OnRequest,
 		onDownloadPrimaryPlaylist: c.OnDownloadPrimaryPlaylist,

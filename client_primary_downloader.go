@@ -128,6 +128,7 @@ type clientPrimaryDownloader struct {
 	startDistance             int
 	maxDistance               int
 	httpClient                *http.Client
+	retryConfig               *clientRetryConfig
 	errGroup                  *errgroup.Group
 	onRequest                 ClientOnRequestFunc
 	onDownloadPrimaryPlaylist ClientOnDownloadPrimaryPlaylistFunc
@@ -195,6 +196,7 @@ func (d *clientPrimaryDownloader) run(errGroupCtx context.Context) error {
 			startDistance:            d.startDistance,
 			maxDistance:              d.maxDistance,
 			httpClient:               d.httpClient,
+			retryConfig:              d.retryConfig,
 			onRequest:                d.onRequest,
 			onDownloadStreamPlaylist: d.onDownloadStreamPlaylist,
 			onDownloadSegment:        d.onDownloadSegment,
@@ -230,6 +232,7 @@ func (d *clientPrimaryDownloader) run(errGroupCtx context.Context) error {
 			startDistance:            d.startDistance,
 			maxDistance:              d.maxDistance,
 			httpClient:               d.httpClient,
+			retryConfig:              d.retryConfig,
 			onRequest:                d.onRequest,
 			onDownloadStreamPlaylist: d.onDownloadStreamPlaylist,
 			onDownloadSegment:        d.onDownloadSegment,
@@ -272,6 +275,7 @@ func (d *clientPrimaryDownloader) run(errGroupCtx context.Context) error {
 						startDistance:            d.startDistance,
 						maxDistance:              d.maxDistance,
 						httpClient:               d.httpClient,
+						retryConfig:              d.retryConfig,
 						onDownloadStreamPlaylist: d.onDownloadStreamPlaylist,
 						onDownloadSegment:        d.onDownloadSegment,
 						onDownloadPart:           d.onDownloadPart,
