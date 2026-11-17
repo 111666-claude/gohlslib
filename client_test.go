@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2949,6 +2950,491 @@ func TestClientLifecycleErrorBeforeTracks(t *testing.T) {
 			require.Error(t, err)
 			require.NotSame(t, gohlslib.ErrClientEOS, err)
 			require.Contains(t, err.Error(), "404")
+		})
+	}
+}
+
+func TestClientPreferredAudioLanguage(t *testing.T) {
+	for _, ca := range []string{
+		"match",
+		"fallback_default",
+		"fallback_stable_order",
+		"duplicate_languages",
+		"embedded",
+		"no_audio_group",
+		"bad_uri",
+		"download_failure",
+	} {
+		t.Run(ca, func(t *testing.T) {
+			var mu sync.Mutex
+			requests := make(map[string]int)
+
+			countRequest := func(path string) {
+				mu.Lock()
+				defer mu.Unlock()
+				requests[path]++
+			}
+
+			getRequests := func(path string) int {
+				mu.Lock()
+				defer mu.Unlock()
+				return requests[path]
+			}
+
+			writeVideoPlaylist := func(w http.ResponseWriter, withAudio bool) {
+				initURI := "init_video.mp4"
+				segmentURI := "segment_video.mp4"
+				if withAudio {
+					initURI = "init_video_audio.mp4"
+					segmentURI = "segment_video_audio.mp4"
+				}
+				w.Header().Set("Content-Type", `application/vnd.apple.mpegurl`)
+				w.Write([]byte("#EXTM3U\n" +
+					"#EXT-X-VERSION:7\n" +
+					"#EXT-X-MEDIA-SEQUENCE:20\n" +
+					"#EXT-X-PLAYLIST-TYPE:VOD\n" +
+					"#EXT-X-INDEPENDENT-SEGMENTS\n" +
+					"#EXT-X-TARGETDURATION:2\n" +
+					"#EXT-X-MAP:URI=\"" + initURI + "\"\n" +
+					"#EXT-X-PROGRAM-DATE-TIME:2015-02-05T01:02:02Z\n" +
+					"#EXTINF:2,\n" +
+					segmentURI + "\n" +
+					"#EXT-X-ENDLIST\n"))
+			}
+
+			writeAudioPlaylist := func(w http.ResponseWriter, n string) {
+				w.Header().Set("Content-Type", `application/vnd.apple.mpegurl`)
+				w.Write([]byte("#EXTM3U\n" +
+					"#EXT-X-VERSION:7\n" +
+					"#EXT-X-MEDIA-SEQUENCE:20\n" +
+					"#EXT-X-PLAYLIST-TYPE:VOD\n" +
+					"#EXT-X-INDEPENDENT-SEGMENTS\n" +
+					"#EXT-X-TARGETDURATION:2\n" +
+					"#EXT-X-MAP:URI=\"init_audio" + n + ".mp4\"\n" +
+					"#EXT-X-PROGRAM-DATE-TIME:2014-02-05T01:02:02Z\n" +
+					"#EXTINF:2,\n" +
+					"segment_audio" + n + ".mp4\n" +
+					"#EXT-X-ENDLIST"))
+			}
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				countRequest(r.URL.Path)
+
+				switch r.URL.Path {
+				case "/index.m3u8":
+					w.Header().Set("Content-Type", `application/vnd.apple.mpegurl`)
+					switch ca {
+					case "no_audio_group":
+						// single media playlist, without any AUDIO group:
+						// the preference must be ignored.
+						w.Write([]byte("#EXTM3U\n" +
+							"#EXT-X-VERSION:7\n" +
+							"#EXT-X-MEDIA-SEQUENCE:20\n" +
+							"#EXT-X-PLAYLIST-TYPE:VOD\n" +
+							"#EXT-X-INDEPENDENT-SEGMENTS\n" +
+							"#EXT-X-TARGETDURATION:2\n" +
+							"#EXT-X-MAP:URI=\"init_video_audio.mp4\"\n" +
+							"#EXT-X-PROGRAM-DATE-TIME:2015-02-05T01:02:02Z\n" +
+							"#EXTINF:2,\n" +
+							"segment_video_audio.mp4\n" +
+							"#EXT-X-ENDLIST\n"))
+
+					case "fallback_stable_order":
+						// no DEFAULT rendition: fall back to playlist order.
+						w.Write([]byte("#EXTM3U\n" +
+							"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\"," +
+							"AUTOSELECT=YES,LANGUAGE=\"en\",URI=\"audio1.m3u8\"\n" +
+							"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"German\"," +
+							"AUTOSELECT=YES,LANGUAGE=\"de\",URI=\"audio2.m3u8\"\n" +
+							"#EXT-X-STREAM-INF:BANDWIDTH=7680000,CODECS=\"avc1.640015,mp4a.40.5\",AUDIO=\"aac\"\n" +
+							"video.m3u8\n"))
+
+					case "duplicate_languages":
+						// two renditions with the same language:
+						// the first one in playlist order must be picked.
+						w.Write([]byte("#EXTM3U\n" +
+							"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\"," +
+							"AUTOSELECT=YES,LANGUAGE=\"en\",URI=\"audio1.m3u8\"\n" +
+							"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English Alt\"," +
+							"AUTOSELECT=YES,LANGUAGE=\"en\",URI=\"audio3.m3u8\"\n" +
+							"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"German\"," +
+							"DEFAULT=YES,AUTOSELECT=YES,LANGUAGE=\"de\",URI=\"audio2.m3u8\"\n" +
+							"#EXT-X-STREAM-INF:BANDWIDTH=7680000,CODECS=\"avc1.640015,mp4a.40.5\",AUDIO=\"aac\"\n" +
+							"video.m3u8\n"))
+
+					case "embedded":
+						// the matching rendition has no URI:
+						// audio is embedded in the leading stream.
+						w.Write([]byte("#EXTM3U\n" +
+							"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\"," +
+							"DEFAULT=YES,AUTOSELECT=YES,LANGUAGE=\"en\"\n" +
+							"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"German\"," +
+							"AUTOSELECT=YES,LANGUAGE=\"de\",URI=\"audio2.m3u8\"\n" +
+							"#EXT-X-STREAM-INF:BANDWIDTH=7680000,CODECS=\"avc1.640015,mp4a.40.5\",AUDIO=\"aac\"\n" +
+							"video_audio.m3u8\n"))
+
+					case "bad_uri":
+						w.Write([]byte("#EXTM3U\n" +
+							"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\"," +
+							"AUTOSELECT=YES,LANGUAGE=\"en\",URI=\"audio1.m3u8\"\n" +
+							"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"German\"," +
+							"DEFAULT=YES,AUTOSELECT=YES,LANGUAGE=\"de\",URI=\"://invalid\"\n" +
+							"#EXT-X-STREAM-INF:BANDWIDTH=7680000,CODECS=\"avc1.640015,mp4a.40.5\",AUDIO=\"aac\"\n" +
+							"video.m3u8\n"))
+
+					default: // "match", "fallback_default", "download_failure"
+						w.Write([]byte("#EXTM3U\n" +
+							"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\"," +
+							"AUTOSELECT=YES,LANGUAGE=\"en\",URI=\"audio1.m3u8\"\n" +
+							"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"German\"," +
+							"DEFAULT=YES,AUTOSELECT=YES,LANGUAGE=\"de\",URI=\"audio2.m3u8\"\n" +
+							"#EXT-X-STREAM-INF:BANDWIDTH=7680000,CODECS=\"avc1.640015,mp4a.40.5\",AUDIO=\"aac\"\n" +
+							"video.m3u8\n"))
+					}
+
+				case "/video.m3u8":
+					writeVideoPlaylist(w, false)
+
+				case "/video_audio.m3u8":
+					writeVideoPlaylist(w, true)
+
+				case "/audio1.m3u8":
+					writeAudioPlaylist(w, "1")
+
+				case "/audio2.m3u8":
+					if ca == "download_failure" {
+						w.WriteHeader(http.StatusNotFound)
+						return
+					}
+					writeAudioPlaylist(w, "2")
+
+				case "/audio3.m3u8":
+					writeAudioPlaylist(w, "3")
+
+				case "/init_video.mp4":
+					w.Header().Set("Content-Type", `video/mp4`)
+					err := mp4ToWriter(&fmp4.Init{
+						Tracks: []*fmp4.InitTrack{
+							{
+								ID:        1,
+								TimeScale: 90000,
+								Codec: &mp4codecs.H264{
+									SPS: testH264SPS,
+									PPS: testH264PPS,
+								},
+							},
+						},
+					}, w)
+					require.NoError(t, err)
+
+				case "/init_video_audio.mp4":
+					w.Header().Set("Content-Type", `video/mp4`)
+					err := mp4ToWriter(&fmp4.Init{
+						Tracks: []*fmp4.InitTrack{
+							{
+								ID:        1,
+								TimeScale: 90000,
+								Codec: &mp4codecs.H264{
+									SPS: testH264SPS,
+									PPS: testH264PPS,
+								},
+							},
+							{
+								ID:        2,
+								TimeScale: 44100,
+								Codec: &mp4codecs.MPEG4Audio{
+									Config: testAACConfig,
+								},
+							},
+						},
+					}, w)
+					require.NoError(t, err)
+
+				case "/init_audio1.mp4", "/init_audio2.mp4", "/init_audio3.mp4":
+					w.Header().Set("Content-Type", `video/mp4`)
+					err := mp4ToWriter(&fmp4.Init{
+						Tracks: []*fmp4.InitTrack{
+							{
+								ID:        1,
+								TimeScale: 44100,
+								Codec: &mp4codecs.MPEG4Audio{
+									Config: testAACConfig,
+								},
+							},
+						},
+					}, w)
+					require.NoError(t, err)
+
+				case "/segment_video.mp4":
+					w.Header().Set("Content-Type", `video/mp4`)
+					err := mp4ToWriter(&fmp4.Part{
+						Tracks: []*fmp4.PartTrack{
+							{
+								ID:       1,
+								BaseTime: 90000 * 6,
+								Samples: []*fmp4.Sample{
+									{
+										Duration:  90000 / 30,
+										PTSOffset: 90000 * 2,
+										Payload: mustMarshalAVCC([][]byte{
+											{7, 1, 2, 3},
+											{8},
+											{5},
+										}),
+									},
+								},
+							},
+						},
+					}, w)
+					require.NoError(t, err)
+
+				case "/segment_video_audio.mp4":
+					w.Header().Set("Content-Type", `video/mp4`)
+					err := mp4ToWriter(&fmp4.Part{
+						Tracks: []*fmp4.PartTrack{
+							{
+								ID:       1,
+								BaseTime: 90000 * 6,
+								Samples: []*fmp4.Sample{
+									{
+										Duration:  90000 / 30,
+										PTSOffset: 90000 * 2,
+										Payload: mustMarshalAVCC([][]byte{
+											{7, 1, 2, 3},
+											{8},
+											{5},
+										}),
+									},
+								},
+							},
+							{
+								ID:       2,
+								BaseTime: 44100 * 6,
+								Samples: []*fmp4.Sample{
+									{
+										Duration: 44100 / 30,
+										Payload:  []byte{1, 2, 3, 4},
+									},
+								},
+							},
+						},
+					}, w)
+					require.NoError(t, err)
+
+				case "/segment_audio1.mp4", "/segment_audio2.mp4", "/segment_audio3.mp4":
+					var payload []byte
+					switch r.URL.Path {
+					case "/segment_audio1.mp4":
+						payload = []byte{1, 2, 3, 4}
+					case "/segment_audio2.mp4":
+						payload = []byte{4, 3, 2, 1}
+					default:
+						payload = []byte{9, 9, 9, 9}
+					}
+					w.Header().Set("Content-Type", `video/mp4`)
+					err := mp4ToWriter(&fmp4.Part{
+						Tracks: []*fmp4.PartTrack{
+							{
+								ID:       1,
+								BaseTime: 44100 * 6,
+								Samples: []*fmp4.Sample{
+									{
+										Duration: 44100 / 30,
+										Payload:  payload,
+									},
+								},
+							},
+						},
+					}, w)
+					require.NoError(t, err)
+
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+
+			preferredLanguage := "de"
+			switch ca {
+			case "fallback_default", "fallback_stable_order":
+				preferredLanguage = "fr"
+			case "duplicate_languages", "embedded":
+				preferredLanguage = "en"
+			}
+
+			type audioSample struct {
+				pts     int64
+				payload []byte
+				ntp     time.Time
+			}
+
+			var dataMu sync.Mutex
+			var audioSamples []audioSample
+			var videoNTP time.Time
+
+			var c *gohlslib.Client
+			c = &gohlslib.Client{
+				URI:                    server.URL + "/index.m3u8",
+				PreferredAudioLanguage: preferredLanguage,
+				OnTracks: func(tracks []*gohlslib.Track) error {
+					expectedAudio := &gohlslib.Track{
+						Codec: &codecs.MPEG4Audio{
+							Config: mpeg4audio.AudioSpecificConfig{
+								Type:          2,
+								SampleRate:    44100,
+								ChannelConfig: 2,
+								ChannelCount:  2, //nolint:staticcheck
+							},
+						},
+						ClockRate: 44100,
+					}
+
+					switch ca {
+					case "match", "fallback_default":
+						expectedAudio.Name = "German"
+						expectedAudio.Language = "de"
+						expectedAudio.IsDefault = true
+
+					case "fallback_stable_order", "duplicate_languages":
+						expectedAudio.Name = "English"
+						expectedAudio.Language = "en"
+					}
+
+					require.Equal(t, []*gohlslib.Track{
+						{
+							Codec: &codecs.H264{
+								SPS: testH264SPS,
+								PPS: testH264PPS,
+							},
+							ClockRate: 90000,
+						},
+						expectedAudio,
+					}, tracks)
+
+					c.OnDataH26x(tracks[0], func(pts int64, dts int64, au [][]byte) {
+						require.Equal(t, int64(0), dts)
+						require.Equal(t, int64(2*90000), pts)
+						require.Equal(t, [][]byte{
+							{7, 1, 2, 3},
+							{8},
+							{5},
+						}, au)
+						ntp, ok := c.AbsoluteTime(tracks[0])
+						require.Equal(t, true, ok)
+						dataMu.Lock()
+						videoNTP = ntp
+						dataMu.Unlock()
+					})
+
+					c.OnDataMPEG4Audio(tracks[1], func(pts int64, aus [][]byte) {
+						ntp, ok := c.AbsoluteTime(tracks[1])
+						require.Equal(t, true, ok)
+						dataMu.Lock()
+						audioSamples = append(audioSamples, audioSample{
+							pts:     pts,
+							payload: aus[0],
+							ntp:     ntp,
+						})
+						dataMu.Unlock()
+					})
+
+					return nil
+				},
+			}
+
+			err := c.Start()
+			require.NoError(t, err)
+
+			err = c.Wait2()
+
+			switch ca {
+			case "bad_uri":
+				require.Error(t, err)
+				require.NotSame(t, gohlslib.ErrClientEOS, err)
+
+			case "download_failure":
+				require.Error(t, err)
+				require.NotSame(t, gohlslib.ErrClientEOS, err)
+				require.Contains(t, err.Error(), "404")
+
+			default:
+				require.Equal(t, gohlslib.ErrClientEOS, err)
+			}
+
+			c.Close()
+
+			// non-selected audio renditions must never be requested.
+			switch ca {
+			case "match", "fallback_default", "download_failure":
+				require.Equal(t, 0, getRequests("/audio1.m3u8"))
+				require.Equal(t, 0, getRequests("/init_audio1.mp4"))
+				require.Equal(t, 0, getRequests("/segment_audio1.mp4"))
+
+			case "fallback_stable_order":
+				require.Equal(t, 0, getRequests("/audio2.m3u8"))
+				require.Equal(t, 0, getRequests("/init_audio2.mp4"))
+				require.Equal(t, 0, getRequests("/segment_audio2.mp4"))
+
+			case "duplicate_languages":
+				require.Equal(t, 0, getRequests("/audio2.m3u8"))
+				require.Equal(t, 0, getRequests("/audio3.m3u8"))
+				require.Equal(t, 0, getRequests("/init_audio3.mp4"))
+				require.Equal(t, 0, getRequests("/segment_audio3.mp4"))
+
+			case "embedded":
+				require.Equal(t, 0, getRequests("/audio2.m3u8"))
+				require.Equal(t, 0, getRequests("/init_audio2.mp4"))
+				require.Equal(t, 0, getRequests("/segment_audio2.mp4"))
+
+			case "bad_uri":
+				require.Equal(t, 0, getRequests("/audio1.m3u8"))
+			}
+
+			// check requests and data of the selected rendition.
+			switch ca {
+			case "match", "fallback_default":
+				require.GreaterOrEqual(t, getRequests("/audio2.m3u8"), 1)
+				require.Equal(t, 1, getRequests("/init_audio2.mp4"))
+				require.Equal(t, 1, getRequests("/segment_audio2.mp4"))
+
+				dataMu.Lock()
+				require.Equal(t, []audioSample{{
+					pts:     0,
+					payload: []byte{4, 3, 2, 1},
+					ntp:     time.Date(2015, time.February, 5, 1, 2, 2, 0, time.UTC),
+				}}, audioSamples)
+				require.Equal(t, time.Date(2015, time.February, 5, 1, 2, 2, 0, time.UTC), videoNTP)
+				dataMu.Unlock()
+
+			case "fallback_stable_order", "duplicate_languages":
+				require.GreaterOrEqual(t, getRequests("/audio1.m3u8"), 1)
+				require.Equal(t, 1, getRequests("/init_audio1.mp4"))
+				require.Equal(t, 1, getRequests("/segment_audio1.mp4"))
+
+				dataMu.Lock()
+				require.Equal(t, []audioSample{{
+					pts:     0,
+					payload: []byte{1, 2, 3, 4},
+					ntp:     time.Date(2015, time.February, 5, 1, 2, 2, 0, time.UTC),
+				}}, audioSamples)
+				dataMu.Unlock()
+
+			case "embedded", "no_audio_group":
+				require.Equal(t, 1, getRequests("/init_video_audio.mp4"))
+				require.Equal(t, 1, getRequests("/segment_video_audio.mp4"))
+
+				dataMu.Lock()
+				require.Equal(t, []audioSample{{
+					pts:     0,
+					payload: []byte{1, 2, 3, 4},
+					ntp:     time.Date(2015, time.February, 5, 1, 2, 2, 0, time.UTC),
+				}}, audioSamples)
+				require.Equal(t, time.Date(2015, time.February, 5, 1, 2, 2, 0, time.UTC), videoNTP)
+				dataMu.Unlock()
+
+			case "download_failure":
+				require.GreaterOrEqual(t, getRequests("/audio2.m3u8"), 1)
+			}
 		})
 	}
 }

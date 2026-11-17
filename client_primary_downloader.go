@@ -119,6 +119,31 @@ func getRenditionsByGroup(
 	return ret
 }
 
+// pickAudioRendition picks a single audio rendition from a group,
+// according to a preferred language.
+// The selection is deterministic: the first rendition with a matching
+// language is picked; if none matches, the DEFAULT rendition is picked;
+// if there is no DEFAULT rendition, the first rendition in playlist
+// order is picked.
+func pickAudioRendition(
+	renditions []*playlist.MultivariantRendition,
+	preferredLanguage string,
+) *playlist.MultivariantRendition {
+	for _, r := range renditions {
+		if strings.EqualFold(r.Language, preferredLanguage) {
+			return r
+		}
+	}
+
+	for _, r := range renditions {
+		if r.Default {
+			return r
+		}
+	}
+
+	return renditions[0]
+}
+
 type clientPrimaryDownloaderParent interface {
 	setTracks([]*Track) (map[*Track]*clientTrack, error)
 }
@@ -128,6 +153,7 @@ type clientPrimaryDownloader struct {
 	startDistance             int
 	maxDistance               int
 	httpClient                *http.Client
+	preferredAudioLanguage    string
 	errGroup                  *errgroup.Group
 	onRequest                 ClientOnRequestFunc
 	onDownloadPrimaryPlaylist ClientOnDownloadPrimaryPlaylistFunc
@@ -252,6 +278,14 @@ func (d *clientPrimaryDownloader) run(errGroupCtx context.Context) error {
 			audioPlaylists := getRenditionsByGroup(plt.Renditions, leadingPlaylist.Audio)
 			if audioPlaylists == nil {
 				return fmt.Errorf("no playlist with Group ID \"%s\" found", leadingPlaylist.Audio)
+			}
+
+			// when a preferred audio language is set, download a single,
+			// deterministically-selected audio rendition instead of all of them.
+			if d.preferredAudioLanguage != "" {
+				audioPlaylists = []*playlist.MultivariantRendition{
+					pickAudioRendition(audioPlaylists, d.preferredAudioLanguage),
+				}
 			}
 
 			for _, pl := range audioPlaylists {

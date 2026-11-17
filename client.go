@@ -99,6 +99,13 @@ type Client struct {
 	// HTTP client.
 	// It defaults to a new http.Client with cookies enabled.
 	HTTPClient *http.Client
+	// Preferred audio language.
+	// When set, only the audio rendition of the selected variant's AUDIO group
+	// whose LANGUAGE matches this value is downloaded.
+	// If no rendition matches, the DEFAULT rendition is used,
+	// falling back to the first rendition in playlist order.
+	// It defaults to empty, meaning that all audio renditions are downloaded.
+	PreferredAudioLanguage string
 
 	//
 	// callbacks (all optional)
@@ -299,6 +306,7 @@ func (c *Client) runInner() error {
 		startDistance:             c.StartDistance,
 		maxDistance:               c.MaxDistance,
 		httpClient:                c.HTTPClient,
+		preferredAudioLanguage:    c.PreferredAudioLanguage,
 		errGroup:                  errGroup,
 		onRequest:                 c.OnRequest,
 		onDownloadPrimaryPlaylist: c.OnDownloadPrimaryPlaylist,
