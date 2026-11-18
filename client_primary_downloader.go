@@ -121,26 +121,29 @@ func getRenditionsByGroup(
 
 type clientPrimaryDownloaderParent interface {
 	setTracks([]*Track) (map[*Track]*clientTrack, error)
+	updateSessionData(added []*SessionData, removed []*SessionData)
 }
 
 type clientPrimaryDownloader struct {
-	primaryPlaylistURL        *url.URL
-	startDistance             int
-	maxDistance               int
-	httpClient                *http.Client
-	errGroup                  *errgroup.Group
-	onRequest                 ClientOnRequestFunc
-	onDownloadPrimaryPlaylist ClientOnDownloadPrimaryPlaylistFunc
-	onDownloadStreamPlaylist  ClientOnDownloadStreamPlaylistFunc
-	onDownloadSegment         ClientOnDownloadSegmentFunc
-	onDownloadPart            ClientOnDownloadPartFunc
-	onDecodeError             ClientOnDecodeErrorFunc
-	parent                    clientPrimaryDownloaderParent
+	primaryPlaylistURL             *url.URL
+	startDistance                  int
+	maxDistance                    int
+	primaryPlaylistRefreshInterval time.Duration
+	httpClient                     *http.Client
+	errGroup                       *errgroup.Group
+	onRequest                      ClientOnRequestFunc
+	onDownloadPrimaryPlaylist      ClientOnDownloadPrimaryPlaylistFunc
+	onDownloadStreamPlaylist       ClientOnDownloadStreamPlaylistFunc
+	onDownloadSegment              ClientOnDownloadSegmentFunc
+	onDownloadPart                 ClientOnDownloadPartFunc
+	onDecodeError                  ClientOnDecodeErrorFunc
+	parent                         clientPrimaryDownloaderParent
 
 	clientTracks     map[*Track]*clientTrack
 	timeConv         clientTimeConv
 	timeConvReady    chan struct{}
 	chProcessorError chan error
+	sessionData      map[sessionDataKey]*SessionData
 }
 
 func (d *clientPrimaryDownloader) initialize() {
@@ -214,6 +217,12 @@ func (d *clientPrimaryDownloader) run(errGroupCtx context.Context) error {
 		streams = append(streams, stream)
 
 	case *playlist.Multivariant:
+		d.processSessionData(errGroupCtx, finalURL, plt.SessionData)
+
+		d.errGroup.Go(func() error {
+			return d.runPrimaryPlaylistRefresher(errGroupCtx)
+		})
+
 		leadingPlaylist := pickLeadingPlaylist(plt.Variants)
 		if leadingPlaylist == nil {
 			return fmt.Errorf("no variants with supported codecs found")

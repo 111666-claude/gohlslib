@@ -19,6 +19,9 @@ type Multivariant struct {
 	// EXT-X-START
 	Start *MultivariantStart
 
+	// EXT-X-SESSION-DATA
+	SessionData []*MultivariantSessionData
+
 	// EXT-X-STREAM-INF (at least one is required)
 	Variants []*MultivariantVariant
 
@@ -71,6 +74,17 @@ func (m *Multivariant) Unmarshal(buf []byte) error {
 				return err
 			}
 
+		case strings.HasPrefix(line, "#EXT-X-SESSION-DATA:"):
+			line = line[len("#EXT-X-SESSION-DATA:"):]
+
+			var sd MultivariantSessionData
+			err = sd.unmarshal(line)
+			if err != nil {
+				return fmt.Errorf("invalid session data: %w", err)
+			}
+
+			m.SessionData = append(m.SessionData, &sd)
+
 		case strings.HasPrefix(line, "#EXT-X-STREAM-INF:"):
 			line = line[len("#EXT-X-STREAM-INF:"):]
 
@@ -103,6 +117,18 @@ func (m *Multivariant) Unmarshal(buf []byte) error {
 		return fmt.Errorf("no variants found")
 	}
 
+	// a Master Playlist MUST NOT contain more than one EXT-X-SESSION-DATA
+	// tag with the same DATA-ID attribute and the same LANGUAGE attribute.
+	sessionDataKeys := make(map[[2]string]struct{})
+	for _, sd := range m.SessionData {
+		key := [2]string{sd.DataID, sd.Language}
+		if _, ok := sessionDataKeys[key]; ok {
+			return fmt.Errorf("duplicated session data with DATA-ID \"%s\" and LANGUAGE \"%s\"",
+				sd.DataID, sd.Language)
+		}
+		sessionDataKeys[key] = struct{}{}
+	}
+
 	return nil
 }
 
@@ -118,6 +144,14 @@ func (m Multivariant) Marshal() ([]byte, error) {
 
 	if m.Start != nil {
 		ret.WriteString(m.Start.marshal())
+	}
+
+	if len(m.SessionData) != 0 {
+		ret.WriteString("\n")
+
+		for _, sd := range m.SessionData {
+			ret.WriteString(sd.marshal())
+		}
 	}
 
 	if len(m.Renditions) != 0 {

@@ -850,6 +850,54 @@ QualityLevels(5977913)/Manifest(video,format=m3u8-aapl)
 			},
 		},
 	},
+	{
+		"session data",
+		"#EXTM3U\n" +
+			"#EXT-X-VERSION:3\n" +
+			"#EXT-X-SESSION-DATA:DATA-ID=\"com.example.title\",VALUE=\"Hello\",LANGUAGE=\"en\"\n" +
+			"#EXT-X-SESSION-DATA:DATA-ID=\"com.example.title\",VALUE=\"Bonjour\",LANGUAGE=\"fr\"\n" +
+			"#EXT-X-SESSION-DATA:DATA-ID=\"com.example.json\",URI=\"https://example.com/data.json\"\n" +
+			"#EXT-X-STREAM-INF:BANDWIDTH=100000,CODECS=\"avc1.42c028,mp4a.40.2\"\n" +
+			"stream.m3u8\n",
+		"#EXTM3U\n" +
+			"#EXT-X-VERSION:3\n" +
+			"\n" +
+			"#EXT-X-SESSION-DATA:DATA-ID=\"com.example.title\",VALUE=\"Hello\",LANGUAGE=\"en\"\n" +
+			"#EXT-X-SESSION-DATA:DATA-ID=\"com.example.title\",VALUE=\"Bonjour\",LANGUAGE=\"fr\"\n" +
+			"#EXT-X-SESSION-DATA:DATA-ID=\"com.example.json\",URI=\"https://example.com/data.json\"\n" +
+			"\n" +
+			"#EXT-X-STREAM-INF:BANDWIDTH=100000,CODECS=\"avc1.42c028,mp4a.40.2\"\n" +
+			"stream.m3u8\n",
+		playlist.Multivariant{
+			Version: 3,
+			SessionData: []*playlist.MultivariantSessionData{
+				{
+					DataID:   "com.example.title",
+					Value:    new("Hello"),
+					Language: "en",
+				},
+				{
+					DataID:   "com.example.title",
+					Value:    new("Bonjour"),
+					Language: "fr",
+				},
+				{
+					DataID: "com.example.json",
+					URI:    new("https://example.com/data.json"),
+				},
+			},
+			Variants: []*playlist.MultivariantVariant{
+				{
+					Bandwidth: 100000,
+					Codecs: []string{
+						"avc1.42c028",
+						"mp4a.40.2",
+					},
+					URI: "stream.m3u8",
+				},
+			},
+		},
+	},
 }
 
 func TestMultivariantUnmarshal(t *testing.T) {
@@ -907,6 +955,71 @@ func TestMultivariantMarshal(t *testing.T) {
 			byts, err := ca.dec.Marshal()
 			require.NoError(t, err)
 			require.Equal(t, ca.output, string(byts))
+		})
+	}
+}
+
+func TestMultivariantUnmarshalErrors(t *testing.T) {
+	for _, ca := range []struct {
+		name  string
+		input string
+		err   string
+	}{
+		{
+			"session data without data-id",
+			"#EXTM3U\n" +
+				"#EXT-X-SESSION-DATA:VALUE=\"Hello\"\n" +
+				"#EXT-X-STREAM-INF:BANDWIDTH=100000\n" +
+				"stream.m3u8\n",
+			"invalid session data: DATA-ID missing",
+		},
+		{
+			"session data without value and uri",
+			"#EXTM3U\n" +
+				"#EXT-X-SESSION-DATA:DATA-ID=\"com.example.title\"\n" +
+				"#EXT-X-STREAM-INF:BANDWIDTH=100000\n" +
+				"stream.m3u8\n",
+			"invalid session data: either VALUE or URI is required",
+		},
+		{
+			"session data with value and uri",
+			"#EXTM3U\n" +
+				"#EXT-X-SESSION-DATA:DATA-ID=\"com.example.title\",VALUE=\"Hello\"" +
+				",URI=\"https://example.com/data.json\"\n" +
+				"#EXT-X-STREAM-INF:BANDWIDTH=100000\n" +
+				"stream.m3u8\n",
+			"invalid session data: VALUE and URI cannot be both present",
+		},
+		{
+			"session data with invalid uri",
+			"#EXTM3U\n" +
+				"#EXT-X-SESSION-DATA:DATA-ID=\"com.example.title\",URI=\"http://[::1\"\n" +
+				"#EXT-X-STREAM-INF:BANDWIDTH=100000\n" +
+				"stream.m3u8\n",
+			"invalid session data: invalid URI",
+		},
+		{
+			"session data with non-absolute uri",
+			"#EXTM3U\n" +
+				"#EXT-X-SESSION-DATA:DATA-ID=\"com.example.title\",URI=\"data.json\"\n" +
+				"#EXT-X-STREAM-INF:BANDWIDTH=100000\n" +
+				"stream.m3u8\n",
+			"invalid session data: URI is not absolute",
+		},
+		{
+			"duplicated session data",
+			"#EXTM3U\n" +
+				"#EXT-X-SESSION-DATA:DATA-ID=\"com.example.title\",VALUE=\"Hello\",LANGUAGE=\"en\"\n" +
+				"#EXT-X-SESSION-DATA:DATA-ID=\"com.example.title\",VALUE=\"Hello2\",LANGUAGE=\"en\"\n" +
+				"#EXT-X-STREAM-INF:BANDWIDTH=100000\n" +
+				"stream.m3u8\n",
+			"duplicated session data with DATA-ID \"com.example.title\" and LANGUAGE \"en\"",
+		},
+	} {
+		t.Run(ca.name, func(t *testing.T) {
+			var m playlist.Multivariant
+			err := m.Unmarshal([]byte(ca.input))
+			require.ErrorContains(t, err, ca.err)
 		})
 	}
 }

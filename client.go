@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -51,6 +52,11 @@ type ClientOnRequestFunc func(*http.Request)
 
 // ClientOnTracksFunc is the prototype of the function passed to OnTracks().
 type ClientOnTracksFunc func([]*Track) error
+
+// ClientOnSessionDataFunc is the prototype of the function passed to OnSessionData().
+// added contains entries that are new or changed since the last call,
+// while removed contains entries that are not present anymore.
+type ClientOnSessionDataFunc func(added []*SessionData, removed []*SessionData)
 
 // ClientOnDataAV1Func is the prototype of the function passed to OnDataAV1().
 type ClientOnDataAV1Func func(pts int64, tu [][]byte)
@@ -99,6 +105,10 @@ type Client struct {
 	// HTTP client.
 	// It defaults to a new http.Client with cookies enabled.
 	HTTPClient *http.Client
+	// Interval between refreshes of the primary playlist of a
+	// multivariant stream, performed to detect session data changes.
+	// It defaults to 5 seconds.
+	PrimaryPlaylistRefreshInterval time.Duration
 
 	//
 	// callbacks (all optional)
@@ -107,6 +117,9 @@ type Client struct {
 	OnRequest ClientOnRequestFunc
 	// called when tracks are available.
 	OnTracks ClientOnTracksFunc
+	// called when session data entries of the primary playlist
+	// are added, changed or removed.
+	OnSessionData ClientOnSessionDataFunc
 	// called before downloading a primary playlist.
 	OnDownloadPrimaryPlaylist ClientOnDownloadPrimaryPlaylistFunc
 	// called before downloading a stream playlist.
@@ -128,6 +141,8 @@ type Client struct {
 	primaryDownloader *clientPrimaryDownloader
 	tracks            map[*Track]*clientTrack
 	closeError        error
+	sessionDataMutex  sync.RWMutex
+	sessionData       []*SessionData
 
 	// out
 	done chan struct{}
@@ -140,6 +155,9 @@ func (c *Client) Start() error {
 	}
 	if c.MaxDistance == 0 {
 		c.MaxDistance = 5
+	}
+	if c.PrimaryPlaylistRefreshInterval == 0 {
+		c.PrimaryPlaylistRefreshInterval = 5 * time.Second
 	}
 	if c.HTTPClient == nil {
 		jar, _ := cookiejar.New(nil)
@@ -154,6 +172,9 @@ func (c *Client) Start() error {
 		c.OnTracks = func(_ []*Track) error {
 			return nil
 		}
+	}
+	if c.OnSessionData == nil {
+		c.OnSessionData = func(_ []*SessionData, _ []*SessionData) {}
 	}
 	if c.OnDownloadPrimaryPlaylist == nil {
 		c.OnDownloadPrimaryPlaylist = func(u string) {
@@ -277,6 +298,18 @@ func (c *Client) AbsoluteTime(track *Track) (time.Time, bool) {
 	return c.tracks[track].absoluteTime()
 }
 
+// SessionData returns the current EXT-X-SESSION-DATA entries
+// of the primary playlist.
+// Returned entries must not be modified.
+func (c *Client) SessionData() []*SessionData {
+	c.sessionDataMutex.RLock()
+	defer c.sessionDataMutex.RUnlock()
+
+	ret := make([]*SessionData, len(c.sessionData))
+	copy(ret, c.sessionData)
+	return ret
+}
+
 func (c *Client) run() {
 	c.closeError = c.runInner()
 	close(c.done)
@@ -295,18 +328,19 @@ func (c *Client) runInner() error {
 	})
 
 	c.primaryDownloader = &clientPrimaryDownloader{
-		primaryPlaylistURL:        c.playlistURL,
-		startDistance:             c.StartDistance,
-		maxDistance:               c.MaxDistance,
-		httpClient:                c.HTTPClient,
-		errGroup:                  errGroup,
-		onRequest:                 c.OnRequest,
-		onDownloadPrimaryPlaylist: c.OnDownloadPrimaryPlaylist,
-		onDownloadStreamPlaylist:  c.OnDownloadStreamPlaylist,
-		onDownloadSegment:         c.OnDownloadSegment,
-		onDownloadPart:            c.OnDownloadPart,
-		onDecodeError:             c.OnDecodeError,
-		parent:                    c,
+		primaryPlaylistURL:             c.playlistURL,
+		startDistance:                  c.StartDistance,
+		maxDistance:                    c.MaxDistance,
+		primaryPlaylistRefreshInterval: c.PrimaryPlaylistRefreshInterval,
+		httpClient:                     c.HTTPClient,
+		errGroup:                       errGroup,
+		onRequest:                      c.OnRequest,
+		onDownloadPrimaryPlaylist:      c.OnDownloadPrimaryPlaylist,
+		onDownloadStreamPlaylist:       c.OnDownloadStreamPlaylist,
+		onDownloadSegment:              c.OnDownloadSegment,
+		onDownloadPart:                 c.OnDownloadPart,
+		onDecodeError:                  c.OnDecodeError,
+		parent:                         c,
 	}
 	c.primaryDownloader.initialize()
 

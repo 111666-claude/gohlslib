@@ -2952,3 +2952,240 @@ func TestClientLifecycleErrorBeforeTracks(t *testing.T) {
 		})
 	}
 }
+
+func TestClientSessionData(t *testing.T) {
+	var phase atomic.Int32
+	var serverURL string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/index.m3u8":
+			w.Header().Set("Content-Type", `application/vnd.apple.mpegurl`)
+
+			var sessionData string
+			if phase.Load() == 0 {
+				sessionData = "#EXT-X-SESSION-DATA:DATA-ID=\"com.example.title\",VALUE=\"Hello\",LANGUAGE=\"en\"\n" +
+					"#EXT-X-SESSION-DATA:DATA-ID=\"com.example.title\",VALUE=\"Bonjour\",LANGUAGE=\"fr\"\n"
+			} else {
+				sessionData = "#EXT-X-SESSION-DATA:DATA-ID=\"com.example.title\",VALUE=\"Hi\",LANGUAGE=\"en\"\n"
+			}
+
+			w.Write([]byte("#EXTM3U\n" +
+				"#EXT-X-VERSION:3\n" +
+				sessionData +
+				"#EXT-X-SESSION-DATA:DATA-ID=\"com.example.json\",URI=\"" + serverURL + "/data.json\"\n" +
+				"#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS=\"avc1.640015\"\n" +
+				"stream.m3u8\n"))
+
+		case "/data.json":
+			w.Header().Set("Content-Type", `application/json`)
+			w.Write([]byte(`{"title":"hello"}`))
+
+		case "/stream.m3u8":
+			w.Header().Set("Content-Type", `application/vnd.apple.mpegurl`)
+			w.Write([]byte("#EXTM3U\n" +
+				"#EXT-X-VERSION:3\n" +
+				"#EXT-X-TARGETDURATION:2\n" +
+				"#EXT-X-MEDIA-SEQUENCE:0\n" +
+				"#EXTINF:2,\n" +
+				"segment1.ts\n" +
+				"#EXTINF:2,\n" +
+				"segment2.ts\n" +
+				"#EXTINF:2,\n" +
+				"null.ts\n"))
+
+		case "/segment1.ts", "/segment2.ts":
+			w.Header().Set("Content-Type", `video/MP2T`)
+			h264Track := &mpegts.Track{Codec: &tscodecs.H264{}}
+			mw := &mpegts.Writer{W: w, Tracks: []*mpegts.Track{h264Track}}
+			err := mw.Initialize()
+			require.NoError(t, err)
+			err = mw.WriteH264(h264Track, 90000, 90000, [][]byte{{7, 1, 2, 3}, {8}, {5}})
+			require.NoError(t, err)
+
+		// keep the request pending to simulate a live stream
+		// that does not advance, without killing the client.
+		case "/null.ts":
+			<-r.Context().Done()
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	serverURL = server.URL
+
+	type notification struct {
+		added   []*gohlslib.SessionData
+		removed []*gohlslib.SessionData
+	}
+
+	notify := make(chan notification, 10)
+	videoRecv := make(chan struct{})
+
+	var c *gohlslib.Client
+	c = &gohlslib.Client{
+		URI:                            server.URL + "/index.m3u8",
+		PrimaryPlaylistRefreshInterval: 100 * time.Millisecond,
+		OnDownloadPrimaryPlaylist:      func(_ string) {},
+		OnDownloadStreamPlaylist:       func(_ string) {},
+		OnDownloadSegment:              func(_ string) {},
+		OnTracks: func(tracks []*gohlslib.Track) error {
+			c.OnDataH26x(tracks[0], func(_ int64, _ int64, _ [][]byte) {
+				select {
+				case <-videoRecv:
+				default:
+					close(videoRecv)
+				}
+			})
+			return nil
+		},
+		OnSessionData: func(added []*gohlslib.SessionData, removed []*gohlslib.SessionData) {
+			notify <- notification{added: added, removed: removed}
+		},
+	}
+
+	err := c.Start()
+	require.NoError(t, err)
+	defer c.Close()
+
+	recvNotification := func() notification {
+		t.Helper()
+		select {
+		case n := <-notify:
+			return n
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for session data notification")
+			return notification{}
+		}
+	}
+
+	// initial download: all entries are notified
+	n := recvNotification()
+	require.Len(t, n.removed, 0)
+	require.Len(t, n.added, 3)
+
+	require.Equal(t, "com.example.json", n.added[0].DataID)
+	require.Equal(t, "", n.added[0].Language)
+	require.Equal(t, `{"title":"hello"}`, *n.added[0].Value)
+	require.Equal(t, server.URL+"/data.json", *n.added[0].URI)
+
+	require.Equal(t, "com.example.title", n.added[1].DataID)
+	require.Equal(t, "en", n.added[1].Language)
+	require.Equal(t, "Hello", *n.added[1].Value)
+	require.Nil(t, n.added[1].URI)
+
+	require.Equal(t, "com.example.title", n.added[2].DataID)
+	require.Equal(t, "fr", n.added[2].Language)
+	require.Equal(t, "Bonjour", *n.added[2].Value)
+	require.Nil(t, n.added[2].URI)
+
+	// the current snapshot is exposed through SessionData()
+	require.Len(t, c.SessionData(), 3)
+
+	// media playback is unaffected
+	select {
+	case <-videoRecv:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for video data")
+	}
+
+	// refresh: only changed entries are notified
+	phase.Store(1)
+
+	n = recvNotification()
+	require.Len(t, n.added, 1)
+	require.Equal(t, "com.example.title", n.added[0].DataID)
+	require.Equal(t, "en", n.added[0].Language)
+	require.Equal(t, "Hi", *n.added[0].Value)
+
+	require.Len(t, n.removed, 1)
+	require.Equal(t, "com.example.title", n.removed[0].DataID)
+	require.Equal(t, "fr", n.removed[0].Language)
+	require.Equal(t, "Bonjour", *n.removed[0].Value)
+
+	require.Len(t, c.SessionData(), 2)
+}
+
+func TestClientSessionDataURILoadError(t *testing.T) {
+	var serverURL string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/index.m3u8":
+			w.Header().Set("Content-Type", `application/vnd.apple.mpegurl`)
+			w.Write([]byte("#EXTM3U\n" +
+				"#EXT-X-VERSION:3\n" +
+				"#EXT-X-SESSION-DATA:DATA-ID=\"com.example.title\",VALUE=\"Hello\",LANGUAGE=\"en\"\n" +
+				"#EXT-X-SESSION-DATA:DATA-ID=\"com.example.json\",URI=\"" + serverURL + "/data.json\"\n" +
+				"#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS=\"avc1.640015\"\n" +
+				"stream.m3u8\n"))
+
+		case "/data.json":
+			w.WriteHeader(http.StatusInternalServerError)
+
+		case "/stream.m3u8":
+			w.Header().Set("Content-Type", `application/vnd.apple.mpegurl`)
+			w.Write([]byte("#EXTM3U\n" +
+				"#EXT-X-VERSION:3\n" +
+				"#EXT-X-TARGETDURATION:2\n" +
+				"#EXT-X-MEDIA-SEQUENCE:0\n" +
+				"#EXTINF:2,\n" +
+				"segment.ts\n"))
+
+		case "/segment.ts":
+			w.Header().Set("Content-Type", `video/MP2T`)
+			h264Track := &mpegts.Track{Codec: &tscodecs.H264{}}
+			mw := &mpegts.Writer{W: w, Tracks: []*mpegts.Track{h264Track}}
+			err := mw.Initialize()
+			require.NoError(t, err)
+			err = mw.WriteH264(h264Track, 90000, 90000, [][]byte{{7, 1, 2, 3}, {8}, {5}})
+			require.NoError(t, err)
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	serverURL = server.URL
+
+	decodeErr := make(chan error, 10)
+	sessionDataRecv := make(chan struct{}, 10)
+
+	c := &gohlslib.Client{
+		URI:                            server.URL + "/index.m3u8",
+		PrimaryPlaylistRefreshInterval: 100 * time.Millisecond,
+		OnDownloadPrimaryPlaylist:      func(_ string) {},
+		OnDownloadStreamPlaylist:       func(_ string) {},
+		OnDownloadSegment:              func(_ string) {},
+		OnDecodeError: func(err error) {
+			decodeErr <- err
+		},
+		OnSessionData: func(added []*gohlslib.SessionData, _ []*gohlslib.SessionData) {
+			if len(added) != 0 {
+				sessionDataRecv <- struct{}{}
+			}
+		},
+	}
+
+	err := c.Start()
+	require.NoError(t, err)
+	defer c.Close()
+
+	// the failed entry is skipped, the other one is still notified
+	select {
+	case <-sessionDataRecv:
+	case <-time.After(5 * time.Second):
+		t.FailNow()
+	}
+
+	select {
+	case err = <-decodeErr:
+		require.ErrorContains(t, err, "unable to download session data \"com.example.json\"")
+	case <-time.After(5 * time.Second):
+		t.FailNow()
+	}
+
+	require.Len(t, c.SessionData(), 1)
+	require.Equal(t, "com.example.title", c.SessionData()[0].DataID)
+}
