@@ -117,6 +117,10 @@ type Client struct {
 	OnDownloadPart ClientOnDownloadPartFunc
 	// called when a non-fatal decode error occurs.
 	OnDecodeError ClientOnDecodeErrorFunc
+	// called when ID3 timed metadata is received from a MPEG-TS stream.
+	// The callback is fired in sync with playback, at the moment
+	// in which the media time reaches the metadata timestamp.
+	OnDataID3 ClientOnDataID3Func
 
 	//
 	// private
@@ -178,6 +182,10 @@ func (c *Client) Start() error {
 	if c.OnDecodeError == nil {
 		c.OnDecodeError = func(err error) {
 			log.Println(err.Error())
+		}
+	}
+	if c.OnDataID3 == nil {
+		c.OnDataID3 = func(_ int64, _ *ID3Metadata) {
 		}
 	}
 
@@ -306,6 +314,7 @@ func (c *Client) runInner() error {
 		onDownloadSegment:         c.OnDownloadSegment,
 		onDownloadPart:            c.OnDownloadPart,
 		onDecodeError:             c.OnDecodeError,
+		onDataID3:                 c.OnDataID3,
 		parent:                    c,
 	}
 	c.primaryDownloader.initialize()

@@ -135,6 +135,7 @@ type clientPrimaryDownloader struct {
 	onDownloadSegment         ClientOnDownloadSegmentFunc
 	onDownloadPart            ClientOnDownloadPartFunc
 	onDecodeError             ClientOnDecodeErrorFunc
+	onDataID3                 ClientOnDataID3Func
 	parent                    clientPrimaryDownloaderParent
 
 	clientTracks     map[*Track]*clientTrack
@@ -200,6 +201,7 @@ func (d *clientPrimaryDownloader) run(errGroupCtx context.Context) error {
 			onDownloadSegment:        d.onDownloadSegment,
 			onDownloadPart:           d.onDownloadPart,
 			onDecodeError:            d.onDecodeError,
+			onDataID3:                d.onDataID3,
 			playlistURL:              finalURL,
 			firstPlaylist:            plt,
 			errGroup:                 d.errGroup,
@@ -235,6 +237,7 @@ func (d *clientPrimaryDownloader) run(errGroupCtx context.Context) error {
 			onDownloadSegment:        d.onDownloadSegment,
 			onDownloadPart:           d.onDownloadPart,
 			onDecodeError:            d.onDecodeError,
+			onDataID3:                d.onDataID3,
 			playlistURL:              u,
 			firstPlaylist:            nil,
 			errGroup:                 d.errGroup,
@@ -276,6 +279,7 @@ func (d *clientPrimaryDownloader) run(errGroupCtx context.Context) error {
 						onDownloadSegment:        d.onDownloadSegment,
 						onDownloadPart:           d.onDownloadPart,
 						onDecodeError:            d.onDecodeError,
+						onDataID3:                d.onDataID3,
 						playlistURL:              u,
 						rendition:                pl,
 						errGroup:                 d.errGroup,

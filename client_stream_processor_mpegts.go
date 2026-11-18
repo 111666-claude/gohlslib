@@ -43,6 +43,7 @@ func (r *switchableReader) Read(p []byte) (int, error) {
 
 type clientStreamProcessorMPEGTS struct {
 	onDecodeError ClientOnDecodeErrorFunc
+	onDataID3     ClientOnDataID3Func
 	isLeading     bool
 	segmentQueue  *clientSegmentQueue
 	errGroup      *errgroup.Group
@@ -58,11 +59,22 @@ type clientStreamProcessorMPEGTS struct {
 	timeConv          *clientTimeConvMPEGTS
 	queuedSamples     []func() error
 
+	id3Extractor *clientID3ExtractorMPEGTS
+	id3Track     *clientTrack
+	id3Proc      *clientTrackProcessorMPEGTS
+	id3Seen      map[id3Event]struct{}
+	id3SeenOrder []id3Event
+
 	chTrackProcessorDone chan struct{}
 }
 
 func (p *clientStreamProcessorMPEGTS) initialize() {
 	p.chTrackProcessorDone = make(chan struct{}, clientMaxTracksPerStream)
+	p.id3Extractor = &clientID3ExtractorMPEGTS{
+		onDecodeError: p.onDecodeError,
+	}
+	p.id3Extractor.initialize()
+	p.id3Seen = make(map[id3Event]struct{})
 }
 
 func (p *clientStreamProcessorMPEGTS) run(errGroupCtx context.Context) error {
@@ -113,7 +125,50 @@ func (p *clientStreamProcessorMPEGTS) processSegment(errGroupCtx context.Context
 		return fmt.Errorf("could not find data of leading track")
 	}
 
+	err := p.processID3(errGroupCtx, seg)
+	if err != nil {
+		return err
+	}
+
 	return p.joinTrackProcessors(errGroupCtx)
+}
+
+// processID3 extracts ID3 timed metadata from the segment payload
+// and dispatches events in PTS order, skipping already-seen ones.
+func (p *clientStreamProcessorMPEGTS) processID3(errGroupCtx context.Context, seg *segmentData) error {
+	events := p.id3Extractor.processSegment(seg.payload)
+	if len(events) == 0 {
+		return nil
+	}
+
+	// dispatch events in PTS order, taking the 33-bit PTS wrap into account
+	sortID3EventsByPTS(events)
+
+	for _, ev := range events {
+		// do not dispatch events that have already been seen,
+		// for instance after a playlist refresh or a reconnect
+		if _, ok := p.id3Seen[ev]; ok {
+			continue
+		}
+		p.id3Seen[ev] = struct{}{}
+		p.id3SeenOrder = append(p.id3SeenOrder, ev)
+		if len(p.id3SeenOrder) > clientMaxID3SeenEvents {
+			delete(p.id3Seen, p.id3SeenOrder[0])
+			p.id3SeenOrder = p.id3SeenOrder[1:]
+		}
+
+		if p.id3Track.startSystem.IsZero() {
+			p.id3Track.startSystem = p.timeConv.startSystem
+		}
+
+		err := p.processSample(errGroupCtx, false, p.id3Proc, ev.pts, ev.pts,
+			[][]byte{[]byte(ev.title), []byte(ev.artist)})
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (p *clientStreamProcessorMPEGTS) joinTrackProcessors(errGroupCtx context.Context) error {
@@ -314,6 +369,32 @@ func (p *clientStreamProcessorMPEGTS) initializeTrackProcessors(errGroupCtx cont
 
 		p.trackProcessors[track.track] = trackProc
 	}
+
+	// allocate a pseudo-track that paces ID3 events like media samples,
+	// so that metadata callbacks fire in sync with playback
+	p.id3Track = &clientTrack{
+		track: &Track{
+			ClockRate: 90000,
+		},
+		onData: func(pts int64, _ int64, data [][]byte) {
+			p.onDataID3(pts, &ID3Metadata{
+				Title:  string(data[0]),
+				Artist: string(data[1]),
+			})
+		},
+	}
+
+	p.id3Proc = &clientTrackProcessorMPEGTS{
+		track:           p.id3Track,
+		streamProcessor: p,
+	}
+	p.id3Proc.initialize()
+
+	p.errGroup.Go(func() error {
+		return p.id3Proc.run(errGroupCtx)
+	})
+
+	p.trackProcessors[p.id3Track.track] = p.id3Proc
 
 	return nil
 }

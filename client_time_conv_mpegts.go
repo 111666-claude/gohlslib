@@ -16,6 +16,7 @@ type clientTimeConvMPEGTS struct {
 	ntpAvailable bool
 	ntpValue     time.Time
 	ntpTimestamp int64
+	startSystem  time.Time
 
 	chLeadingNTPReceived chan struct{}
 }
@@ -24,6 +25,7 @@ func (ts *clientTimeConvMPEGTS) initialize() {
 	ts.td = &mpegts.TimeDecoder{}
 	ts.td.Initialize()
 	ts.td.Decode(ts.startDTS)
+	ts.startSystem = time.Now()
 	ts.chLeadingNTPReceived = make(chan struct{})
 }
 

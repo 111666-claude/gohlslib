@@ -86,6 +86,7 @@ type clientStreamDownloader struct {
 	onDownloadSegment        ClientOnDownloadSegmentFunc
 	onDownloadPart           ClientOnDownloadPartFunc
 	onDecodeError            ClientOnDecodeErrorFunc
+	onDataID3                ClientOnDataID3Func
 	playlistURL              *url.URL
 	rendition                *playlist.MultivariantRendition
 	firstPlaylist            *playlist.Media
@@ -146,6 +147,7 @@ func (d *clientStreamDownloader) run(errGroupCtx context.Context) error {
 	} else {
 		proc := &clientStreamProcessorMPEGTS{
 			onDecodeError: d.onDecodeError,
+			onDataID3:     d.onDataID3,
 			isLeading:     d.isLeading,
 			segmentQueue:  d.segmentQueue,
 			errGroup:      d.errGroup,
